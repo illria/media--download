@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import app as core
+from starlette.responses import Response
 
 _original_error = core.err
 
@@ -48,13 +49,9 @@ def runtime_probe(url: str, cookie_id: str | None) -> dict[str, Any]:
     raw: dict[str, Any] | None = None
     try:
         for label, compat in attempts:
-            command = runtime_base(url, cookie_path, compat) + [
-                "--dump-single-json", "--no-warnings", url,
-            ]
+            command = runtime_base(url, cookie_path, compat) + ["--dump-single-json", "--no-warnings", url]
             try:
-                result = subprocess.run(
-                    command, capture_output=True, text=True, timeout=22,
-                )
+                result = subprocess.run(command, capture_output=True, text=True, timeout=22)
             except subprocess.TimeoutExpired:
                 errors.append(f"{label}解析超时")
                 continue
@@ -87,10 +84,7 @@ def runtime_probe(url: str, cookie_id: str | None) -> dict[str, Any]:
         "drm": bool(raw.get("has_drm")),
         "video_options": videos,
         "audio_options": audios,
-        "subtitles": sorted(
-            set(raw.get("subtitles") or {})
-            | set(raw.get("automatic_captions") or {})
-        ),
+        "subtitles": sorted(set(raw.get("subtitles") or {}) | set(raw.get("automatic_captions") or {})),
         "webpage_url": raw.get("webpage_url") or url,
     }
 
@@ -106,10 +100,7 @@ def runtime_execute(task_id: str) -> None:
             raise RuntimeError("no space")
         cookie_path = core.cpath(task["options"].get("cookie_id"))
         (core.TMP / task_id).mkdir(parents=True, exist_ok=True)
-        core.patch(
-            task_id, status="downloading", progress=0,
-            error_code=None, error_message=None, log_tail="",
-        )
+        core.patch(task_id, status="downloading", progress=0, error_code=None, error_message=None, log_tail="")
         return_code = 1
         attempts = [False, True] if core.yt(task["url"]) else [False]
         for attempt_index, compat in enumerate(attempts):
@@ -129,17 +120,14 @@ def runtime_execute(task_id: str) -> None:
                 clean = line.strip()
                 if clean:
                     logs = (logs + [clean])[-120:]
-                progress_match = re.search(
-                    r"PROGRESS:\s*([0-9.]+)%\|([^|]*)\|([^|]*)", clean,
-                )
-                if progress_match:
-                    displayed = min(float(progress_match.group(1)), 98.0)
+                match = re.search(r"PROGRESS:\s*([0-9.]+)%\|([^|]*)\|([^|]*)", clean)
+                if match:
                     core.patch(
                         task_id,
                         status="downloading",
-                        progress=displayed,
-                        speed=progress_match.group(2),
-                        eta=progress_match.group(3),
+                        progress=min(float(match.group(1)), 98.0),
+                        speed=match.group(2),
+                        eta=match.group(3),
                         log_tail="\n".join(logs),
                     )
                 if any(marker in clean for marker in (
@@ -147,8 +135,11 @@ def runtime_execute(task_id: str) -> None:
                     "[ExtractAudio]", "[Metadata]", "[ThumbnailsConvertor]",
                 )):
                     core.patch(
-                        task_id, status="processing", progress=99,
-                        speed="", eta="正在合并/处理",
+                        task_id,
+                        status="processing",
+                        progress=99,
+                        speed="",
+                        eta="正在合并/处理",
                         log_tail="\n".join(logs),
                     )
                 current = core.row(task_id)
@@ -165,15 +156,17 @@ def runtime_execute(task_id: str) -> None:
         if return_code:
             code, message = friendly_error("\n".join(logs), task["url"])
             raise RuntimeError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
-        core.patch(
-            task_id, status="processing", progress=99,
-            speed="", eta="正在整理文件", log_tail="\n".join(logs),
-        )
+        core.patch(task_id, status="processing", progress=99, speed="", eta="正在整理文件", log_tail="\n".join(logs))
         output_path, output_size = core.move(task_id)
         core.patch(
-            task_id, status="completed", progress=100,
-            speed="", eta="", output_path=output_path,
-            output_size=output_size, finished=core.now(),
+            task_id,
+            status="completed",
+            progress=100,
+            speed="",
+            eta="",
+            output_path=output_path,
+            output_size=output_size,
+            finished=core.now(),
             log_tail="\n".join(logs),
         )
     except Exception as exc:
@@ -182,11 +175,7 @@ def runtime_execute(task_id: str) -> None:
             code, message = parsed["code"], parsed["message"]
         except Exception:
             code, message = friendly_error(str(exc), task["url"])
-        core.patch(
-            task_id, status="failed", error_code=code,
-            error_message=message, finished=core.now(),
-            log_tail="\n".join(logs),
-        )
+        core.patch(task_id, status="failed", error_code=code, error_message=message, finished=core.now(), log_tail="\n".join(logs))
     finally:
         if cookie_path:
             cookie_path.unlink(missing_ok=True)
@@ -198,6 +187,25 @@ core.base = runtime_base
 core.err = friendly_error
 core.probe_sync = runtime_probe
 core.execute = runtime_execute
+
+@core.app.middleware("http")
+async def inject_auto_download(request, call_next):
+    response = await call_next(request)
+    if request.url.path not in {"/", "/index.html"}:
+        return response
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type:
+        return response
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+    html = body.decode("utf-8", errors="replace")
+    if "/assets/auto_download.js" not in html:
+        html = html.replace("</body>", '<script src="/assets/auto_download.js"></script></body>')
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    return Response(content=html, status_code=response.status_code, headers=headers, media_type="text/html")
+
 app = core.app
 
 if __name__ == "__main__":
