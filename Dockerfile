@@ -19,6 +19,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 COPY app.py ./
+COPY runtime_app.py ./
 COPY static ./static
 COPY strip_auth.py ./
 
@@ -29,4 +30,4 @@ RUN python strip_auth.py \
 EXPOSE 19190
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "app.py"]
+CMD ["python", "runtime_app.py"]
