@@ -1,4 +1,13 @@
 services:
+  youtube-pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: youtube-pot-provider
+    restart: unless-stopped
+    mem_limit: 192m
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+
   media-download-hub:
     build:
       context: .
@@ -6,17 +15,20 @@ services:
     image: media-download-hub:latest
     container_name: media-download-hub
     restart: unless-stopped
+    depends_on:
+      - youtube-pot-provider
     ports:
       - "19190:19190"
     environment:
       APP_PORT: "19190"
       DATA_ROOT: "/data"
       TZ: "Etc/UTC"
+      POT_PROVIDER_URL: "http://youtube-pot-provider:4416"
       COOKIE_ENCRYPTION_KEY: "${COOKIE_ENCRYPTION_KEY:-}"
       SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
     volumes:
       - ./data-v2:/data
-    mem_limit: 850m
+    mem_limit: 700m
     pids_limit: 256
     security_opt:
       - no-new-privileges:true
