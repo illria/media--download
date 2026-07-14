@@ -1,0 +1,30 @@
+services:
+  media-download-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: media-download-hub:latest
+    container_name: media-download-hub
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19190:19190"
+    environment:
+      APP_PORT: "19190"
+      DATA_ROOT: "/data"
+      TZ: "Etc/UTC"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      SECRET_KEY: "${SECRET_KEY:-}"
+      COOKIE_ENCRYPTION_KEY: "${COOKIE_ENCRYPTION_KEY:-}"
+    volumes:
+      - ./data:/data
+    mem_limit: 850m
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:19190/api/health',timeout=5)); raise SystemExit(0 if d.get('ok') else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 40s
