@@ -19,12 +19,14 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 COPY app.py ./
-COPY noauth.py ./
 COPY static ./static
+COPY strip_auth.py ./
 
-RUN mkdir -p /data/database /data/downloads /data/temp /data/cookies /data/home
+RUN python strip_auth.py \
+    && rm strip_auth.py \
+    && mkdir -p /data/database /data/downloads /data/temp /data/cookies /data/home
 
 EXPOSE 19190
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "noauth.py"]
+CMD ["python", "app.py"]
