@@ -4,8 +4,12 @@ import os
 
 import runtime_app
 import subtitle_feature
+import youtube_hotfix
+import youtube_reliability
 from starlette.responses import Response
 
+
+youtube_hotfix.install(runtime_app.core, youtube_reliability)
 subtitle_feature.install(runtime_app.core)
 
 
