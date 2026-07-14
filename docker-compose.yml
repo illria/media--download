@@ -13,6 +13,7 @@ services:
       DATA_ROOT: "/data"
       TZ: "Etc/UTC"
       COOKIE_ENCRYPTION_KEY: "${COOKIE_ENCRYPTION_KEY:-}"
+      SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
     volumes:
       - ./data-v2:/data
     mem_limit: 850m
