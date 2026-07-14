@@ -6,7 +6,7 @@ html_path = Path('/app/static/index.html')
 
 app = app_path.read_text(encoding='utf-8')
 
-# 后端：认证依赖改为空操作，并移除所有接口上的认证依赖。
+# 后端彻底移除认证：认证函数不再校验，所有接口不再挂认证依赖。
 app = re.sub(
     r"def auth\(a:str\|None=Header\(None\)\):\n(?:    .*\n){1,6}?def public_url",
     "def auth(a=None):\n    return None\ndef public_url",
@@ -14,14 +14,16 @@ app = re.sub(
 )
 app = app.replace(",dependencies=[Depends(auth)]", "")
 
-# 删除密码模型、启动时密码初始化和认证路由。
+# 删除密码模型和启动时密码初始化；旧数据库里的密码记录也会清除。
 app = re.sub(r"\nclass Pass\(BaseModel\):password:str=Field\(min_length=1,max_length=256\)", "", app)
 app = app.replace(
     "    init();p=os.getenv('ADMIN_PASSWORD')\n    if p and not meta('password'):setmeta('password',hpw(p))\n    STOP.clear();",
     "    init()\n    with con() as c:c.execute(\"DELETE FROM meta WHERE k='password'\")\n    STOP.clear();",
 )
+
+# 整段删除 /api/auth/status、/api/auth/setup、/api/auth/login。
 app = re.sub(
-    r"\n@app\.get\('/api/auth/status'\).*?return \{'token':TOK\.dumps\(\{'sub':'admin'\}\)\}\n",
+    r"\n@app\.get\('/api/auth/status'\).*?(?=\n@app\.post\('/api/probe')",
     "\n",
     app,
     flags=re.S,
@@ -31,11 +33,11 @@ app_path.write_text(app, encoding='utf-8')
 
 html = html_path.read_text(encoding='utf-8')
 
-# 前端：删除登录弹窗和退出按钮。
+# 前端彻底删除登录框和退出按钮。
 html = re.sub(r'<div id="auth" class="modal">.*?</div></div>\s*', '', html, count=1, flags=re.S)
 html = re.sub(r'<button class="btn ghost" onclick="logout\(\)">退出</button>', '', html)
 
-# 移除 token、Authorization 和 401 登录回退逻辑。
+# 不再保存 token，不再发送 Authorization，也不处理 401 登录弹窗。
 html = re.sub(
     r"const \$=x=>document\.getElementById\(x\);let token=.*?;",
     "const $=x=>document.getElementById(x);let probe=null,timer=null;",
