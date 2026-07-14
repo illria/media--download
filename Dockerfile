@@ -18,8 +18,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt \
-    && python -m pip install --no-cache-dir -U --pre "yt-dlp[default,curl-cffi]" \
-    && yt-dlp --version
+    && python -m pip install --no-cache-dir -U --pre "yt-dlp[default,curl-cffi]" yt-dlp-ejs \
+    && python -c "import importlib.metadata as m; print('yt-dlp',m.version('yt-dlp')); print('yt-dlp-ejs',m.version('yt-dlp-ejs'))"
+
 COPY app.py ./
 COPY runtime_app.py ./
 COPY youtube_reliability.py ./
