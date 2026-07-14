@@ -5,10 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     APP_PORT=19190 \
     DATA_ROOT=/data \
-    HOME=/data/home
+    HOME=/data/home \
+    DENO_INSTALL=/opt/deno \
+    PATH=/opt/deno/bin:$PATH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg nodejs tini \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip ffmpeg tini \
+    && curl -fsSL https://deno.land/install.sh | sh \
+    && deno --version \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
