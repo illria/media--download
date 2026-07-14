@@ -17,9 +17,13 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN python -m pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt \
+    && python -m pip install --no-cache-dir -U --pre "yt-dlp[default,curl-cffi]" \
+    && yt-dlp --version
 COPY app.py ./
 COPY runtime_app.py ./
+COPY youtube_reliability.py ./
+COPY youtube_execute.py ./
 COPY subtitle_feature.py ./
 COPY final_app.py ./
 COPY static ./static
