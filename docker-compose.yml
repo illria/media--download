@@ -7,7 +7,7 @@ services:
     container_name: media-download-hub
     restart: unless-stopped
     ports:
-      - "127.0.0.1:19190:19190"
+      - "19190:19190"
     environment:
       APP_PORT: "19190"
       DATA_ROOT: "/data"
