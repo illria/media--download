@@ -12,6 +12,7 @@ services:
       APP_PORT: "19190"
       DATA_ROOT: "/data"
       TZ: "Etc/UTC"
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       SECRET_KEY: "${SECRET_KEY:-}"
       COOKIE_ENCRYPTION_KEY: "${COOKIE_ENCRYPTION_KEY:-}"
