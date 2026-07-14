@@ -3,8 +3,8 @@ services:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     container_name: youtube-pot-provider
     restart: unless-stopped
-    mem_limit: 192m
-    pids_limit: 128
+    mem_limit: 128m
+    pids_limit: 96
     security_opt:
       - no-new-privileges:true
 
@@ -28,8 +28,8 @@ services:
       SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
     volumes:
       - ./data-v2:/data
-    mem_limit: 700m
-    pids_limit: 256
+    mem_limit: 600m
+    pids_limit: 224
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 20s
