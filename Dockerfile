@@ -25,6 +25,7 @@ COPY app.py ./
 COPY runtime_app.py ./
 COPY youtube_reliability.py ./
 COPY youtube_execute.py ./
+COPY youtube_hotfix.py ./
 COPY subtitle_feature.py ./
 COPY final_app.py ./
 COPY static ./static
