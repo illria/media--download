@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 from cryptography.fernet import Fernet
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
@@ -20,15 +20,23 @@ def secret(path,make):
     if path.exists() and path.read_text().strip(): return path.read_text().strip()
     v=make(); path.write_text(v); os.chmod(path,0o600); return v
 SECRET=os.getenv('SECRET_KEY') or secret(DB.parent/'secret.key',lambda:secrets.token_urlsafe(48)); FKEY=os.getenv('COOKIE_ENCRYPTION_KEY') or secret(DB.parent/'cookie.key',lambda:Fernet.generate_key().decode()); F=Fernet(FKEY.encode()); TOK=URLSafeTimedSerializer(SECRET,salt='media-hub')
-DEFAULT={'max_file_size_gb':5,'retention_hours':24,'min_free_gb':5,'max_resolution':1080,'proxy_url':'','youtube_compatibility_mode':True,'request_sleep_seconds':1}
-ACTIVE={}; LOCK=threading.RLock(); STOP=threading.Event()
+GUEST_DEFAULT={'max_file_size_gb':1,'default_resolution':720,'max_resolution':1080,'retention_minutes':30,'min_free_gb':2,'emergency_free_gb':1,'request_sleep_seconds':5,'max_active_tasks_per_guest':1,'max_queued_tasks_per_guest':2,'global_guest_concurrency':1,'max_video_duration_minutes':60,'allow_ai_transcription':True,'ai_transcription_max_duration_minutes':20,'ai_transcription_global_concurrency':1,'ai_transcription_hourly_limit_per_guest':3,'allow_cookie':False,'allow_koofr':False,'allow_live_download':False}
+DEFAULT={'max_file_size_gb':5,'retention_hours':24,'min_free_gb':5,'max_resolution':1080,'proxy_url':'','youtube_compatibility_mode':True,'request_sleep_seconds':1,'guest_policy':GUEST_DEFAULT}
+GUEST_SESSION_COOKIE='media_guest_session'; GUEST_SESSION_MAX_AGE=60*60*24*30; GUEST_PROBE_TTL=10*60
+ACTIVE={}; GUEST_PROBES={}; GUEST_AI_ACTIVE=set(); LOCK=threading.RLock(); STOP=threading.Event()
 def con():
     c=sqlite3.connect(DB,timeout=30,check_same_thread=False); c.row_factory=sqlite3.Row; c.execute('PRAGMA journal_mode=WAL'); return c
 def init():
     with con() as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL);CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL);CREATE TABLE IF NOT EXISTS cookies(id TEXT PRIMARY KEY,platform TEXT,label TEXT,path TEXT,name TEXT,created TEXT);CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,url TEXT,title TEXT,platform TEXT,status TEXT,options TEXT,progress REAL DEFAULT 0,speed TEXT,eta TEXT,output_path TEXT,output_size INTEGER,error_code TEXT,error_message TEXT,log_tail TEXT DEFAULT '',created TEXT,updated TEXT,finished TEXT);''')
+        columns={item['name'] for item in c.execute('PRAGMA table_info(tasks)')}
+        for name,definition in {'owner_type':'TEXT','owner_id':'TEXT','policy_snapshot':'TEXT'}.items():
+            if name not in columns:c.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
+        c.execute("UPDATE tasks SET owner_type='admin',owner_id='admin' WHERE owner_type IS NULL OR owner_type='' OR owner_id IS NULL OR owner_id=''")
+        c.execute('CREATE INDEX IF NOT EXISTS tasks_owner_status_created ON tasks(owner_type,owner_id,status,created)')
         for k,v in DEFAULT.items(): c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)',(k,json.dumps(v)))
-        c.execute("UPDATE tasks SET status='queued',error_code=NULL,error_message=NULL WHERE status IN ('downloading','processing')")
+        if not c.execute("SELECT 1 FROM meta WHERE k='password'").fetchone():c.execute('INSERT INTO meta VALUES(?,?)',('password',hpw('admin')))
+        c.execute("INSERT OR IGNORE INTO meta VALUES('admin_session_version','1')")
 def meta(k):
     with con() as c:r=c.execute('SELECT v FROM meta WHERE k=?',(k,)).fetchone();return r['v'] if r else None
 def setmeta(k,v):
@@ -45,16 +53,79 @@ def save_settings(d):
         for k,v in d.items():
             if k in DEFAULT:c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',(k,json.dumps(v)))
     return settings()
+def _guest_number(value,default,minimum,maximum,integer=False):
+    try:number=int(value) if integer else float(value)
+    except (TypeError,ValueError):number=default
+    number=max(minimum,min(maximum,number));return int(number) if integer else number
+def _guest_bool(value,default):
+    if isinstance(value,bool):return value
+    if isinstance(value,str) and value.lower() in {'true','1','yes'}:return True
+    if isinstance(value,str) and value.lower() in {'false','0','no'}:return False
+    return default
+def normalize_guest_policy(raw=None):
+    incoming=raw if isinstance(raw,dict) else {}; policy=dict(GUEST_DEFAULT)
+    for key in policy:
+        if key in incoming:policy[key]=incoming[key]
+    policy['max_file_size_gb']=_guest_number(policy['max_file_size_gb'],1,.1,20)
+    policy['max_resolution']=_guest_number(policy['max_resolution'],1080,144,2160,True)
+    policy['default_resolution']=min(policy['max_resolution'],_guest_number(policy['default_resolution'],720,144,policy['max_resolution'],True))
+    policy['retention_minutes']=_guest_number(policy['retention_minutes'],30,1,1440,True)
+    policy['min_free_gb']=_guest_number(policy['min_free_gb'],2,.1,100)
+    policy['emergency_free_gb']=min(policy['min_free_gb'],_guest_number(policy['emergency_free_gb'],1,.1,100))
+    policy['request_sleep_seconds']=_guest_number(policy['request_sleep_seconds'],5,0,60)
+    policy['max_active_tasks_per_guest']=_guest_number(policy['max_active_tasks_per_guest'],1,1,10,True)
+    policy['max_queued_tasks_per_guest']=_guest_number(policy['max_queued_tasks_per_guest'],2,1,20,True)
+    policy['global_guest_concurrency']=_guest_number(policy['global_guest_concurrency'],1,1,20,True)
+    policy['max_video_duration_minutes']=_guest_number(policy['max_video_duration_minutes'],60,1,1440,True)
+    policy['ai_transcription_max_duration_minutes']=_guest_number(policy['ai_transcription_max_duration_minutes'],20,1,240,True)
+    policy['ai_transcription_global_concurrency']=_guest_number(policy['ai_transcription_global_concurrency'],1,1,10,True)
+    policy['ai_transcription_hourly_limit_per_guest']=_guest_number(policy['ai_transcription_hourly_limit_per_guest'],3,1,100,True)
+    for key in ('allow_ai_transcription','allow_cookie','allow_koofr','allow_live_download'):policy[key]=_guest_bool(policy[key],GUEST_DEFAULT[key])
+    return policy
+def guest_policy():return normalize_guest_policy(settings().get('guest_policy'))
+def is_guest_task(task):return bool(task and task.get('owner_type')=='guest')
+def task_policy(task):
+    if not is_guest_task(task):return settings()
+    try:return normalize_guest_policy(json.loads(task.get('policy_snapshot') or '{}'))
+    except (TypeError,ValueError,json.JSONDecodeError):return guest_policy()
+def _guest_owner(raw):return hmac.new(SECRET.encode(),raw.encode(),hashlib.sha256).hexdigest()
+def guest_identity(request:Request,response:Response):
+    raw=request.cookies.get(GUEST_SESSION_COOKIE,'')
+    if not re.fullmatch(r'[A-Za-z0-9_\-]{32,256}',raw):
+        raw=secrets.token_urlsafe(32)
+        forwarded=request.headers.get('x-forwarded-proto','').split(',',1)[0].strip().lower()
+        response.set_cookie(GUEST_SESSION_COOKIE,raw,max_age=GUEST_SESSION_MAX_AGE,httponly=True,samesite='lax',secure=request.url.scheme=='https' or forwarded=='https',path='/')
+    return {'owner_type':'guest','owner_id':_guest_owner(raw)}
+def guest_error(code,message,status=400):raise HTTPException(status,detail={'code':code,'message':message})
+def guest_probe_key(owner_id,url):return (owner_id,url)
+def cache_guest_probe(owner_id,url,result):
+    expires=time.monotonic()+GUEST_PROBE_TTL
+    with LOCK:
+        GUEST_PROBES[guest_probe_key(owner_id,url)]={'expires':expires,'result':result}
+        canonical=str(result.get('webpage_url') or url)
+        GUEST_PROBES[guest_probe_key(owner_id,canonical)]={'expires':expires,'result':result}
+        for key,value in list(GUEST_PROBES.items()):
+            if value['expires']<=time.monotonic():GUEST_PROBES.pop(key,None)
+def cached_guest_probe(owner_id,url):
+    with LOCK:cached=GUEST_PROBES.get(guest_probe_key(owner_id,url))
+    return cached.get('result') if cached and cached.get('expires',0)>time.monotonic() else None
 def hpw(p):
     s=os.urandom(16); return s.hex()+':'+hashlib.scrypt(p.encode(),salt=s,n=2**14,r=8,p=1,dklen=32).hex()
 def vpw(p,e):
     try:s,d=e.split(':');return hmac.compare_digest(hashlib.scrypt(p.encode(),salt=bytes.fromhex(s),n=2**14,r=8,p=1,dklen=32).hex(),d)
     except:return False
-def auth(a:str|None=Header(None)):
-    if not a or not a.startswith('Bearer '):raise HTTPException(401,'需要登录')
+def admin_session_version():
+    try:return max(1,int(meta('admin_session_version') or '1'))
+    except (TypeError,ValueError):return 1
+def using_default_password():return vpw('admin',meta('password') or '')
+def admin_token():return TOK.dumps({'sub':'admin','role':'admin','session_version':admin_session_version()})
+def auth(authorization:str|None=Header(None)):
+    if not authorization or not authorization.startswith('Bearer '):raise HTTPException(401,'需要登录')
     try:
-        if TOK.loads(a[7:],max_age=604800).get('sub')!='admin':raise HTTPException(401,'登录失效')
-    except (BadSignature,SignatureExpired):raise HTTPException(401,'登录失效')
+        payload=TOK.loads(authorization[7:],max_age=43200)
+        if payload.get('sub')!='admin' or payload.get('role')!='admin' or int(payload.get('session_version') or 0)!=admin_session_version():raise HTTPException(401,'登录失效')
+        return payload
+    except (BadSignature,SignatureExpired,TypeError,ValueError):raise HTTPException(401,'登录失效')
 def public_url(u):
     p=urlsplit(u.strip());
     if p.scheme not in ('http','https') or not p.hostname:raise HTTPException(400,'只允许 HTTP/HTTPS 链接')
@@ -82,6 +153,11 @@ def base(u,cp=None,compat=False):
     if s.get('proxy_url'):a+=['--proxy',s['proxy_url']]
     if cp:a+=['--cookies',str(cp)]
     if yt(u):a+=['--extractor-args','youtube:player_client='+('web_safari,android_vr,web_embedded' if compat else 'android_vr,web_safari,web_embedded')]
+    return a
+def task_base(task,cp=None,compat=False):
+    if not is_guest_task(task):return base(task['url'],cp,compat)
+    policy=task_policy(task);a=['yt-dlp','--no-playlist','--force-ipv4','--socket-timeout','30','--retries','5','--fragment-retries','5','--extractor-retries','3','--js-runtimes','deno','--impersonate','chrome','--sleep-requests',str(policy['request_sleep_seconds'])]
+    if yt(task['url']):a+=['--extractor-args','youtube:player_client='+('web_safari,android_vr,web_embedded' if compat else 'android_vr,web_safari,web_embedded')]
     return a
 def denied(t):
     t=t.lower();return any(x in t for x in ('403','forbidden','sign in to confirm','not a bot','po token'))
@@ -120,21 +196,78 @@ def probe_sync(u,cid):
         if cp:cp.unlink(missing_ok=True)
     v,a=simplify(raw.get('formats') or [])
     return {'id':raw.get('id'),'title':raw.get('title'),'uploader':raw.get('uploader') or raw.get('channel'),'platform':raw.get('extractor_key') or raw.get('extractor'),'duration':raw.get('duration'),'thumbnail':raw.get('thumbnail'),'is_live':bool(raw.get('is_live') or raw.get('live_status')=='is_live'),'drm':bool(raw.get('has_drm')),'video_options':v,'audio_options':a,'subtitles':sorted(set((raw.get('subtitles') or {}))|set((raw.get('automatic_captions') or {}))),'webpage_url':raw.get('webpage_url') or u}
+def guest_probe_sync(u,policy):
+    raw=None;last='解析失败'
+    for compat in ([False,True] if yt(u) else [False]):
+        command=['yt-dlp','--no-playlist','--force-ipv4','--socket-timeout','30','--retries','5','--fragment-retries','5','--extractor-retries','3','--js-runtimes','deno','--impersonate','chrome','--sleep-requests',str(policy['request_sleep_seconds'])]
+        if yt(u):command+=['--extractor-args','youtube:player_client='+('web_safari,android_vr,web_embedded' if compat else 'android_vr,web_safari,web_embedded')]
+        result=subprocess.run(command+['--dump-single-json','--no-warnings',u],capture_output=True,text=True,timeout=120)
+        if result.returncode==0:
+            raw=json.loads(result.stdout);break
+        last=(result.stderr or result.stdout or last)[-4000:]
+        if not denied(last):break
+    if raw is None:raise RuntimeError(last)
+    videos,audios=simplify(raw.get('formats') or [])
+    return {'id':raw.get('id'),'title':raw.get('title'),'uploader':raw.get('uploader') or raw.get('channel'),'platform':raw.get('extractor_key') or raw.get('extractor'),'duration':raw.get('duration'),'thumbnail':raw.get('thumbnail'),'is_live':bool(raw.get('is_live') or raw.get('live_status')=='is_live'),'drm':bool(raw.get('has_drm')),'video_options':videos,'audio_options':audios,'subtitles':sorted(set((raw.get('subtitles') or {}))|set((raw.get('automatic_captions') or {}))),'webpage_url':raw.get('webpage_url') or u}
 def row(i):
     with con() as c:r=c.execute('SELECT * FROM tasks WHERE id=?',(i,)).fetchone()
     if not r:return None
     d=dict(r);d['options']=json.loads(d.pop('options'));return d
+def guest_task(i,identity):
+    task=row(i)
+    if not task or task.get('owner_type')!='guest' or not hmac.compare_digest(str(task.get('owner_id') or ''),str(identity['owner_id'])):raise HTTPException(404,'任务不存在')
+    return task
+def guest_task_view(task):
+    data=dict(task);data.pop('owner_id',None);data.pop('owner_type',None);data.pop('policy_snapshot',None);data.pop('koofr',None);return data
+def task_directory_size(path):
+    try:return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
+    except OSError:return 0
+def guest_task_size_exceeded(task,path):
+    return is_guest_task(task) and task_directory_size(path)>int(task_policy(task)['max_file_size_gb']*1024**3)
+def guest_limit_failure():return RuntimeError(json.dumps({'code':'guest_file_limit_exceeded','message':'游客单任务文件最大为 1 GB'},ensure_ascii=False))
+def guest_active_count(owner_id=None):
+    query="SELECT COUNT(*) AS n FROM tasks WHERE owner_type='guest' AND status IN ('downloading','processing')";args=[]
+    if owner_id is not None:query+=' AND owner_id=?';args.append(owner_id)
+    with con() as c:return int(c.execute(query,args).fetchone()['n'])
+def guest_queue_count(owner_id):
+    with con() as c:return int(c.execute("SELECT COUNT(*) AS n FROM tasks WHERE owner_type='guest' AND owner_id=? AND status='queued'",(owner_id,)).fetchone()['n'])
+def guest_ai_hourly_count(owner_id):
+    cutoff=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    with con() as c:rows=c.execute("SELECT options FROM tasks WHERE owner_type='guest' AND owner_id=? AND created>=?",(owner_id,cutoff)).fetchall()
+    total=0
+    for item in rows:
+        try:total+=bool(json.loads(item['options']).get('guest_ai_candidate'))
+        except (TypeError,ValueError,json.JSONDecodeError):pass
+    return total
+def acquire_guest_ai_slot(task):
+    if not is_guest_task(task):return False
+    policy=task_policy(task)
+    if not policy['allow_ai_transcription']:raise RuntimeError('GUEST_AI_DISABLED')
+    with LOCK:
+        if len(GUEST_AI_ACTIVE)>=policy['ai_transcription_global_concurrency']:raise RuntimeError('GUEST_AI_BUSY')
+        GUEST_AI_ACTIVE.add(task['id'])
+    return True
+def start_guest_ai(task):
+    if not is_guest_task(task):return False
+    policy=task_policy(task)
+    if not task['options'].get('guest_ai_candidate'):
+        if guest_ai_hourly_count(task['owner_id'])>=policy['ai_transcription_hourly_limit_per_guest']:raise RuntimeError('GUEST_AI_HOURLY_LIMIT')
+        task['options']['guest_ai_candidate']=True;patch(task['id'],options=json.dumps(task['options']))
+    return acquire_guest_ai_slot(task)
+def release_guest_ai_slot(task_id):
+    with LOCK:GUEST_AI_ACTIVE.discard(task_id)
 def patch(i,**v):
     if not v:return
     v['updated']=now(); q=','.join(k+'=?' for k in v)
     with con() as c:c.execute('UPDATE tasks SET '+q+' WHERE id=?',(*v.values(),i))
 def cmd(t,cp,compat=False):
-    o=t['options']; work=TMP/t['id']; out=str(work/'%(title).180B [%(id)s].%(ext)s'); mode=o.get('mode','video')
+    o=t['options']; policy=task_policy(t); work=TMP/t['id']; out=str(work/'%(title).180B [%(id)s].%(ext)s'); mode=o.get('mode','video')
     if mode=='live':
+        if is_guest_task(t):raise RuntimeError(json.dumps({'code':'guest_live_not_allowed','message':'游客不支持直播下载'},ensure_ascii=False))
         a=['streamlink','--force','--output',str(work/'live.ts')];
         if settings().get('proxy_url'):a+=['--http-proxy',settings()['proxy_url']]
         return a+[t['url'],o.get('stream_quality','best')]
-    a=base(t['url'],cp,compat)+['--newline','--restrict-filenames','--paths',f'temp:{work}','--output',out,'--max-filesize',f"{settings()['max_file_size_gb']}G",'--progress-template','download:PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s']
+    a=task_base(t,None if is_guest_task(t) else cp,compat)+['--newline','--restrict-filenames','--paths',f'temp:{work}','--output',out,'--max-filesize',f"{policy['max_file_size_gb']}G",'--progress-template','download:PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s']
     fid=str(o.get('format_id') or '') if re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',str(o.get('format_id') or '')) else ''
     if mode=='thumbnail':a+=['--skip-download','--write-thumbnail','--convert-thumbnails','jpg']
     elif mode=='audio':
@@ -142,7 +275,7 @@ def cmd(t,cp,compat=False):
     elif mode=='subtitles':a+=['--skip-download','--write-subs','--write-auto-subs','--sub-langs',','.join(o.get('subtitle_languages') or ['zh-CN','zh','en']),'--convert-subs','srt']
     else:
         if fid:a+=['--format',fid if o.get('format_has_audio') else fid+'+bestaudio/best']
-        else:a+=['--format',f"bv*[height<={min(int(o.get('resolution',1080)),int(settings()['max_resolution']))}]+ba/b"]
+        else:a+=['--format',f"bv*[height<={min(int(o.get('resolution',1080)),int(policy['max_resolution']))}]+ba/b"]
         a+=['--merge-output-format','mp4']
     if mode not in ('thumbnail','subtitles') and o.get('write_thumbnail'):a+=['--write-thumbnail']
     if mode not in ('thumbnail','subtitles') and o.get('embed_metadata',True):a+=['--embed-metadata']
@@ -155,9 +288,13 @@ def move(i):
     shutil.rmtree(src,ignore_errors=True);p=max(dst.iterdir(),key=lambda x:x.stat().st_size);return str(p),sum(x.stat().st_size for x in dst.iterdir())
 def execute(i):
     t=row(i);cp=None;logs=[]
+    if not t or t.get('status')=='cancelled':return
     try:
-        if shutil.disk_usage(ROOT).free<int(settings()['min_free_gb'])*1024**3:raise RuntimeError('no space')
-        cp=cpath(t['options'].get('cookie_id'));(TMP/i).mkdir(parents=True,exist_ok=True);patch(i,status='downloading',progress=0,error_code=None,error_message=None,log_tail='')
+        policy=task_policy(t);free=shutil.disk_usage(ROOT).free
+        if free<int(policy['min_free_gb'])*1024**3:
+            if is_guest_task(t):raise RuntimeError(json.dumps({'code':'guest_disk_space_low','message':'游客任务暂不可用：服务器剩余空间不足'},ensure_ascii=False))
+            raise RuntimeError('no space')
+        cp=cpath(t['options'].get('cookie_id')) if not is_guest_task(t) else None;(TMP/i).mkdir(parents=True,exist_ok=True);patch(i,status='downloading',progress=0,error_code=None,error_message=None,log_tail='')
         rc=1
         for n,compat in enumerate([False,True] if yt(t['url']) else [False]):
             if n:logs.append('[Media Hub] 首次请求被拒绝，正在切换 YouTube 兼容客户端重试……')
@@ -166,31 +303,80 @@ def execute(i):
             for line in p.stdout:
                 s=line.strip();logs=(logs+[s])[-120:] if s else logs;m=re.search(r'PROGRESS:\s*([0-9.]+)%\|([^|]*)\|([^|]*)',s)
                 if m:patch(i,progress=float(m.group(1)),speed=m.group(2),eta=m.group(3),log_tail='\n'.join(logs))
+                if guest_task_size_exceeded(t,TMP/i):
+                    os.killpg(p.pid,signal.SIGTERM);p.wait(timeout=10);raise guest_limit_failure()
                 if row(i)['status']=='cancelled':os.killpg(p.pid,signal.SIGTERM);break
             rc=p.wait()
             if row(i)['status']=='cancelled':shutil.rmtree(TMP/i,ignore_errors=True);return
             if rc==0 or not denied('\n'.join(logs)):break
         if rc:code,msg=err('\n'.join(logs),t['url']);raise RuntimeError(json.dumps({'code':code,'message':msg},ensure_ascii=False))
-        path,size=move(i);patch(i,status='completed',progress=100,output_path=path,output_size=size,finished=now(),log_tail='\n'.join(logs))
+        path,size=move(i)
+        if (row(i) or {}).get('status')=='cancelled':shutil.rmtree(DL/i,ignore_errors=True);return
+        if is_guest_task(t) and size>int(policy['max_file_size_gb']*1024**3):shutil.rmtree(DL/i,ignore_errors=True);raise guest_limit_failure()
+        patch(i,status='completed',progress=100,output_path=path,output_size=size,finished=now(),log_tail='\n'.join(logs))
     except Exception as e:
         try:x=json.loads(str(e));code,msg=x['code'],x['message']
         except:code,msg=err(str(e),t['url'])
+        if is_guest_task(t) and code not in {'guest_file_limit_exceeded','guest_disk_space_low','guest_live_not_allowed'}:msg='游客任务下载失败，请确认链接为公开可访问的媒体后重试。'
+        if code=='guest_file_limit_exceeded':shutil.rmtree(TMP/i,ignore_errors=True);shutil.rmtree(DL/i,ignore_errors=True)
         patch(i,status='failed',error_code=code,error_message=msg,finished=now(),log_tail='\n'.join(logs))
     finally:
         if cp:cp.unlink(missing_ok=True)
         with LOCK:ACTIVE.pop(i,None)
+def cleanup_expired(guest_only=False):
+    with con() as c:rows=[dict(item) for item in c.execute("SELECT id,finished,owner_type,policy_snapshot FROM tasks WHERE status='completed'")]
+    current=datetime.now(timezone.utc)
+    for item in rows:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',str(item['id'])):continue
+        if guest_only and item.get('owner_type')!='guest':continue
+        try:
+            finished=datetime.fromisoformat(item['finished']) if item.get('finished') else None
+            if not finished:continue
+            if finished.tzinfo is None:finished=finished.replace(tzinfo=timezone.utc)
+            if item.get('owner_type')=='guest':
+                task={'owner_type':'guest','policy_snapshot':item.get('policy_snapshot')};expires=finished+timedelta(minutes=task_policy(task)['retention_minutes'])
+            else:expires=finished+timedelta(hours=int(settings()['retention_hours']))
+            if current<expires:continue
+            for directory in (DL/item['id'],TMP/item['id']):
+                if directory.exists():shutil.rmtree(directory)
+            with con() as c:c.execute("UPDATE tasks SET status='expired',output_path=NULL,output_size=NULL,updated=? WHERE id=?",(now(),item['id']))
+        except Exception:continue
+def guest_emergency_cleanup():
+    cleanup_expired(guest_only=True)
+    with con() as c:rows=[dict(item) for item in c.execute("SELECT id,status FROM tasks WHERE owner_type='guest'")]
+    with LOCK:active=set(ACTIVE)
+    for item in rows:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',str(item['id'])):continue
+        if item['id'] in active or item['status'] in {'downloading','processing'}:continue
+        directory=TMP/item['id']
+        try:
+            if directory.is_dir():shutil.rmtree(directory)
+        except OSError:continue
+def next_queued_task():
+    with con() as c:
+        admin=c.execute("SELECT id FROM tasks WHERE status='queued' AND owner_type='admin' ORDER BY created LIMIT 1").fetchone()
+        guests=[item['id'] for item in c.execute("SELECT id FROM tasks WHERE status='queued' AND owner_type='guest' ORDER BY created")]
+    if admin:return admin['id']
+    for task_id in guests:
+        task=row(task_id)
+        if not task:continue
+        policy=task_policy(task);free=shutil.disk_usage(ROOT).free
+        if free<int(policy['emergency_free_gb'])*1024**3:guest_emergency_cleanup();return None
+        if free<int(policy['min_free_gb'])*1024**3:return None
+        if guest_active_count()>=policy['global_guest_concurrency'] or guest_active_count(task['owner_id'])>=policy['max_active_tasks_per_guest']:continue
+        return task_id
+    return None
 def worker():
     while not STOP.is_set():
         if not ACTIVE:
-            with con() as c:r=c.execute("SELECT id FROM tasks WHERE status='queued' ORDER BY created LIMIT 1").fetchone()
-            if r:execute(r['id']);continue
+            task_id=next_queued_task()
+            if task_id:execute(task_id);continue
         STOP.wait(1)
 def cleanup():
-    while not STOP.wait(900):
-        cut=datetime.now(timezone.utc)-timedelta(hours=int(settings()['retention_hours']))
-        with con() as c:
-            for r in c.execute("SELECT id,finished FROM tasks WHERE status='completed'"):
-                if r['finished'] and datetime.fromisoformat(r['finished'])<cut:shutil.rmtree(DL/r['id'],ignore_errors=True);c.execute("UPDATE tasks SET status='expired',output_path=NULL WHERE id=?",(r['id'],))
+    while not STOP.is_set():
+        try:cleanup_expired()
+        except Exception:pass
+        STOP.wait(60)
 
 class KoofrError(RuntimeError):
     def __init__(self,message,status_code=409):super().__init__(message);self.status_code=status_code
@@ -343,6 +529,7 @@ def _koofr_payload(task):
 def save_task_to_koofr(task_id,allow_processing_subtitles=False):
     task=row(task_id)
     if not task:raise KoofrError('任务不存在',404)
+    if is_guest_task(task):raise KoofrError('游客任务不支持保存到 Koofr',403)
     processing_subtitles=task['status']=='processing' and (task.get('options') or {}).get('mode')=='subtitles'
     if task['status'] not in {'completed','expired'} and not (allow_processing_subtitles and processing_subtitles):raise KoofrError('只有 completed 或 expired 任务可以保存到 Koofr')
     _,sources=_local_output_files(task_id);root,target=_koofr_target(task,force_mount_check=True)
@@ -376,39 +563,94 @@ def _koofr_zip_name(task):
     name=re.sub(r'[\\/:*?"<>|\r\n]+','_',str(task.get('title') or 'media'))
     return (name.strip(' ._')[:100] or 'media')+'-koofr.zip'
 
+def insert_task(url,title,platform,options,owner_type='admin',owner_id='admin',policy_snapshot=None):
+    task_id=uuid.uuid4().hex;created=now()
+    with con() as c:c.execute('INSERT INTO tasks(id,url,title,platform,status,options,created,updated,owner_type,owner_id,policy_snapshot) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(task_id,url,title,platform,'queued',json.dumps(options),created,created,owner_type,owner_id,json.dumps(policy_snapshot) if policy_snapshot else None))
+    return row(task_id)
+def _probe_number(value):
+    try:return int(value)
+    except (TypeError,ValueError):return 0
+def guest_task_options(payload,probed,policy):
+    incoming=payload.options if isinstance(payload.options,dict) else {};mode=str(incoming.get('mode') or 'video')
+    if mode not in {'video','audio','thumbnail','subtitles'}:guest_error('guest_mode_not_allowed','游客不支持该下载类型')
+    if probed.get('is_live') or mode=='live':guest_error('guest_live_not_allowed','游客不支持直播下载')
+    duration=_probe_number(probed.get('duration'))
+    if not duration:guest_error('guest_duration_unknown','游客任务需要可确认的媒体时长')
+    if duration>policy['max_video_duration_minutes']*60:guest_error('guest_duration_limit_exceeded','游客媒体最长支持 60 分钟')
+    limit=int(policy['max_file_size_gb']*1024**3);video_options=probed.get('video_options') or [];audio_options=probed.get('audio_options') or []
+    format_id=str(incoming.get('format_id') or '')
+    if mode=='video':
+        selected=next((item for item in video_options if str(item.get('format_id') or '')==format_id),None) if format_id else None
+        if format_id and not selected:guest_error('guest_format_not_allowed','所选视频格式不可用')
+        requested=_probe_number(incoming.get('resolution')) or policy['default_resolution']
+        height=_probe_number(selected.get('height')) if selected else requested
+        if height>policy['max_resolution']:guest_error('guest_resolution_limit_exceeded','游客最高只支持 1080p')
+        if selected and _probe_number(selected.get('filesize'))>limit:guest_error('guest_file_limit_exceeded','预计文件超过游客 1 GB 限制')
+        candidates=[_probe_number(item.get('filesize')) for item in video_options if _probe_number(item.get('height'))<=height and _probe_number(item.get('filesize'))]
+        if not selected and candidates and min(candidates)>limit:guest_error('guest_file_limit_exceeded','当前清晰度预计文件超过游客 1 GB 限制')
+        options={'mode':'video','resolution':height,'format_id':str(selected.get('format_id')) if selected else None,'format_has_audio':bool(selected.get('has_audio')) if selected else False,'write_thumbnail':False,'embed_metadata':True,'cookie_id':None}
+    elif mode=='audio':
+        selected=next((item for item in audio_options if str(item.get('format_id') or '')==format_id),None) if format_id else None
+        if format_id and not selected:guest_error('guest_format_not_allowed','所选音频格式不可用')
+        if selected and _probe_number(selected.get('filesize'))>limit:guest_error('guest_file_limit_exceeded','预计文件超过游客 1 GB 限制')
+        audio_format=str(incoming.get('audio_format') or 'original');options={'mode':'audio','format_id':str(selected.get('format_id')) if selected else None,'audio_format':audio_format if audio_format in {'original','mp3','m4a','opus','wav','flac'} else 'original','write_thumbnail':False,'embed_metadata':True,'cookie_id':None}
+    elif mode=='thumbnail':options={'mode':'thumbnail','cookie_id':None}
+    else:
+        languages=incoming.get('subtitle_languages');languages=languages if isinstance(languages,list) else ['zh-CN','zh','en']
+        languages=[str(item) for item in languages if re.fullmatch(r'[A-Za-z0-9_-]{1,32}',str(item))][:10] or ['zh-CN','zh','en']
+        ai_candidate=not bool(probed.get('subtitles'))
+        if ai_candidate and (not policy['allow_ai_transcription'] or duration>policy['ai_transcription_max_duration_minutes']*60):guest_error('guest_ai_duration_limit_exceeded','无平台字幕时，游客 AI 字幕最长支持 20 分钟')
+        options={'mode':'subtitles','subtitle_languages':languages,'cookie_id':None,'guest_ai_candidate':ai_candidate}
+    return options
+def admit_guest_task(identity,policy,options):
+    free=shutil.disk_usage(ROOT).free
+    if free<int(policy['emergency_free_gb'])*1024**3:guest_emergency_cleanup();free=shutil.disk_usage(ROOT).free
+    if free<int(policy['min_free_gb'])*1024**3:guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
+    if guest_queue_count(identity['owner_id'])>=policy['max_queued_tasks_per_guest']:guest_error('guest_queue_limit_exceeded','游客最多保留 2 个排队任务',429)
+    if options.get('guest_ai_candidate') and guest_ai_hourly_count(identity['owner_id'])>=policy['ai_transcription_hourly_limit_per_guest']:guest_error('guest_ai_hourly_limit_exceeded','游客 AI 字幕每小时最多 3 次',429)
+
 class Pass(BaseModel):password:str=Field(min_length=1,max_length=256)
+class PasswordChange(BaseModel):current_password:str=Field(min_length=1,max_length=256);new_password:str=Field(min_length=8,max_length=256)
 class Probe(BaseModel):url:str=Field(min_length=8,max_length=2048);cookie_id:str|None=None
 class Task(BaseModel):url:str;title:str|None=None;platform:str|None=None;options:dict[str,Any]={}
 @asynccontextmanager
 async def life(_):
-    init();p=os.getenv('ADMIN_PASSWORD')
-    if p and not meta('password'):setmeta('password',hpw(p))
-    STOP.clear();threading.Thread(target=worker,daemon=True).start();threading.Thread(target=cleanup,daemon=True).start();yield;STOP.set()
+    init();STOP.clear();threading.Thread(target=worker,daemon=True).start();threading.Thread(target=cleanup,daemon=True).start();yield;STOP.set()
 app=FastAPI(lifespan=life)
-@app.get('/api/health')
+@app.get('/api/admin/health',dependencies=[Depends(auth)])
+@app.get('/api/health',dependencies=[Depends(auth)])
 def health():
     u=shutil.disk_usage(ROOT);tools={n:bool(shutil.which(n)) for n in ('yt-dlp','streamlink','ffmpeg','deno')};return {'ok':all(tools.values()),'port':PORT,'tools':tools,'disk':{'total':u.total,'used':u.used,'free':u.free,'percent':round(u.used/u.total*100,1)},'koofr':_koofr_health()}
+@app.get('/api/admin/auth/status')
 @app.get('/api/auth/status')
-def ast():return {'setup_required':not bool(meta('password'))}
+def ast():return {'setup_required':False,'using_default_password':using_default_password(),'session_version':admin_session_version()}
 @app.post('/api/auth/setup')
 def setup(b:Pass):
     if meta('password'):raise HTTPException(409,'密码已设置')
     if len(b.password)<8:raise HTTPException(400,'密码至少 8 位')
-    setmeta('password',hpw(b.password));return {'token':TOK.dumps({'sub':'admin'})}
+    setmeta('password',hpw(b.password));return {'token':admin_token()}
+@app.post('/api/admin/login')
 @app.post('/api/auth/login')
 def login(b:Pass):
     if not vpw(b.password,meta('password') or ''):raise HTTPException(401,'密码错误')
-    return {'token':TOK.dumps({'sub':'admin'})}
+    return {'token':admin_token()}
+@app.post('/api/admin/change-password',dependencies=[Depends(auth)])
+def change_password(b:PasswordChange):
+    current=meta('password') or ''
+    if not vpw(b.current_password,current):raise HTTPException(401,'当前密码错误')
+    if hmac.compare_digest(b.current_password,b.new_password):raise HTTPException(400,'新密码不能与当前密码相同')
+    setmeta('password',hpw(b.new_password));setmeta('admin_session_version',str(admin_session_version()+1));return {'ok':True}
+@app.post('/api/admin/probe',dependencies=[Depends(auth)])
 @app.post('/api/probe',dependencies=[Depends(auth)])
 async def probe(b:Probe):
     u=await validate(b.url)
     try:return await asyncio.to_thread(probe_sync,u,b.cookie_id)
     except Exception as e:code,msg=err(str(e),u);raise HTTPException(400,detail={'code':code,'message':msg})
+@app.post('/api/admin/tasks',dependencies=[Depends(auth)])
 @app.post('/api/tasks',dependencies=[Depends(auth)])
 async def create(b:Task):
-    u=await validate(b.url);i=uuid.uuid4().hex;n=now()
-    with con() as c:c.execute('INSERT INTO tasks(id,url,title,platform,status,options,created,updated) VALUES(?,?,?,?,?,?,?,?)',(i,u,b.title,b.platform,'queued',json.dumps(b.options),n,n))
-    return row(i)
+    u=await validate(b.url);return insert_task(u,b.title,b.platform,b.options,'admin','admin')
+@app.get('/api/admin/tasks',dependencies=[Depends(auth)])
 @app.get('/api/tasks',dependencies=[Depends(auth)])
 def tasks(include_koofr:bool=False):
     with con() as c:ids=[x['id'] for x in c.execute('SELECT id FROM tasks ORDER BY created DESC LIMIT 200')]
@@ -418,6 +660,65 @@ def tasks(include_koofr:bool=False):
         if task and include_koofr and task['status'] in {'completed','expired'}:task['koofr']=_koofr_payload(task)
         if task:output.append(task)
     return output
+@app.get('/api/admin/tasks/{i}',dependencies=[Depends(auth)])
+def admin_task(i):
+    task=row(i)
+    if not task:raise HTTPException(404,'任务不存在')
+    return task
+@app.get('/api/guest/health')
+def guest_health(identity:dict=Depends(guest_identity)):
+    policy=guest_policy();free=shutil.disk_usage(ROOT).free
+    with con() as c:queued=int(c.execute("SELECT COUNT(*) AS n FROM tasks WHERE owner_type='guest' AND status='queued'").fetchone()['n'])
+    return {'ok':True,'accepting_guest_tasks':free>=int(policy['min_free_gb'])*1024**3 and guest_active_count()<policy['global_guest_concurrency'],'queue_length':queued}
+@app.post('/api/guest/probe')
+async def guest_probe(b:Probe,identity:dict=Depends(guest_identity)):
+    u=await validate(b.url);policy=guest_policy()
+    try:result=await asyncio.to_thread(guest_probe_sync,u,policy)
+    except Exception:raise HTTPException(400,detail={'code':'guest_probe_failed','message':'游客解析失败，请确认链接为公开可访问的媒体。'})
+    cache_guest_probe(identity['owner_id'],u,result)
+    allowed=('id','title','uploader','platform','duration','thumbnail','is_live','drm','video_options','audio_options','subtitles','webpage_url')
+    return {key:result.get(key) for key in allowed}
+@app.post('/api/guest/tasks')
+async def create_guest_task(b:Task,identity:dict=Depends(guest_identity)):
+    u=await validate(b.url);probed=cached_guest_probe(identity['owner_id'],u)
+    if not probed:guest_error('guest_probe_required','请先使用游客解析接口重新解析链接',409)
+    policy=guest_policy();options=guest_task_options(b,probed,policy);admit_guest_task(identity,policy,options)
+    task=insert_task(u,probed.get('title'),probed.get('platform'),options,'guest',identity['owner_id'],policy)
+    return guest_task_view(task)
+@app.get('/api/guest/tasks')
+def guest_tasks(identity:dict=Depends(guest_identity)):
+    with con() as c:ids=[item['id'] for item in c.execute("SELECT id FROM tasks WHERE owner_type='guest' AND owner_id=? ORDER BY created DESC LIMIT 200",(identity['owner_id'],))]
+    return [guest_task_view(task) for item in ids if (task:=row(item))]
+@app.get('/api/guest/tasks/{i}')
+def guest_task_detail(i,identity:dict=Depends(guest_identity)):return guest_task_view(guest_task(i,identity))
+@app.post('/api/guest/tasks/{i}/cancel')
+def guest_cancel(i,identity:dict=Depends(guest_identity)):
+    task=guest_task(i,identity);patch(i,status='cancelled',finished=now());process=ACTIVE.get(i)
+    if process:
+        try:os.killpg(process.pid,signal.SIGTERM)
+        except OSError:pass
+    return guest_task_view(row(task['id']))
+@app.post('/api/guest/tasks/{i}/retry')
+def guest_retry(i,identity:dict=Depends(guest_identity)):
+    task=guest_task(i,identity);policy=task_policy(task)
+    if task['status']!='queued' and guest_queue_count(identity['owner_id'])>=policy['max_queued_tasks_per_guest']:guest_error('guest_queue_limit_exceeded','游客最多保留 2 个排队任务',429)
+    if shutil.disk_usage(ROOT).free<int(policy['min_free_gb'])*1024**3:guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
+    patch(i,status='queued',progress=0,error_code=None,error_message=None,output_path=None,output_size=None,finished=None,log_tail='');return guest_task_view(row(i))
+@app.delete('/api/guest/tasks/{i}')
+def guest_delete(i,identity:dict=Depends(guest_identity)):
+    task=guest_task(i,identity);process=ACTIVE.get(task['id'])
+    if process:
+        try:os.killpg(process.pid,signal.SIGTERM)
+        except OSError:pass
+    shutil.rmtree(DL/task['id'],ignore_errors=True);shutil.rmtree(TMP/task['id'],ignore_errors=True)
+    with con() as c:c.execute('DELETE FROM tasks WHERE id=? AND owner_type=? AND owner_id=?',(task['id'],'guest',identity['owner_id']))
+    return {'ok':True}
+@app.get('/api/guest/tasks/{i}/download')
+def guest_download(i,identity:dict=Depends(guest_identity)):
+    task=guest_task(i,identity);path=Path(task['output_path']).resolve() if task.get('output_path') else None
+    if not path or DL not in path.parents or not path.is_file():raise HTTPException(404,'文件不存在')
+    return FileResponse(path,filename=path.name)
+@app.post('/api/admin/tasks/{i}/cancel',dependencies=[Depends(auth)])
 @app.post('/api/tasks/{i}/cancel',dependencies=[Depends(auth)])
 def cancel(i):
     t=row(i)
@@ -427,28 +728,37 @@ def cancel(i):
         try:os.killpg(p.pid,signal.SIGTERM)
         except:pass
     return row(i)
+@app.post('/api/admin/tasks/{i}/retry',dependencies=[Depends(auth)])
 @app.post('/api/tasks/{i}/retry',dependencies=[Depends(auth)])
-def retry(i):patch(i,status='queued',progress=0,error_code=None,error_message=None,output_path=None,output_size=None,finished=None,log_tail='');return row(i)
+def retry(i):
+    if not row(i):raise HTTPException(404,'任务不存在')
+    patch(i,status='queued',progress=0,error_code=None,error_message=None,output_path=None,output_size=None,finished=None,log_tail='');return row(i)
+@app.delete('/api/admin/tasks/{i}',dependencies=[Depends(auth)])
 @app.delete('/api/tasks/{i}',dependencies=[Depends(auth)])
 def delete(i):
+    if not row(i):raise HTTPException(404,'任务不存在')
     shutil.rmtree(DL/i,ignore_errors=True);shutil.rmtree(TMP/i,ignore_errors=True)
     with con() as c:c.execute('DELETE FROM tasks WHERE id=?',(i,))
     return {'ok':True}
+@app.get('/api/admin/tasks/{i}/download',dependencies=[Depends(auth)])
 @app.get('/api/tasks/{i}/download',dependencies=[Depends(auth)])
 def download(i):
     t=row(i);p=Path(t['output_path']).resolve() if t and t.get('output_path') else None
     if not p or DL not in p.parents or not p.is_file():raise HTTPException(404,'文件不存在')
     return FileResponse(p,filename=p.name)
+@app.post('/api/admin/tasks/{i}/save-to-koofr',dependencies=[Depends(auth)])
 @app.post('/api/tasks/{i}/save-to-koofr',dependencies=[Depends(auth)])
 def save_koofr(i):
     try:return save_task_to_koofr(i)
     except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
     finally:_invalidate_koofr_health()
+@app.get('/api/admin/tasks/{i}/koofr-status',dependencies=[Depends(auth)])
 @app.get('/api/tasks/{i}/koofr-status',dependencies=[Depends(auth)])
 def koofr_status(i):
     t=row(i)
     if not t:raise HTTPException(404,'任务不存在')
     return _koofr_payload(t)
+@app.get('/api/admin/tasks/{i}/koofr-download',dependencies=[Depends(auth)])
 @app.get('/api/tasks/{i}/koofr-download',dependencies=[Depends(auth)])
 def koofr_download(i):
     try:
@@ -473,16 +783,20 @@ def koofr_download(i):
             archive_path.unlink(missing_ok=True);raise HTTPException(500,'Koofr 副本打包失败')
         return FileResponse(archive_path,filename=_koofr_zip_name(task),background=BackgroundTask(archive_path.unlink,missing_ok=True))
     finally:_invalidate_koofr_health()
+@app.get('/api/admin/settings',dependencies=[Depends(auth)])
 @app.get('/api/settings',dependencies=[Depends(auth)])
 def gs():
     d=settings();p=d.get('proxy_url','');d['proxy_url']=p[:12]+'••••' if p else '';return d
+@app.put('/api/admin/settings',dependencies=[Depends(auth)])
 @app.put('/api/settings',dependencies=[Depends(auth)])
 def ss(d:dict):
     if 'proxy_url' in d and '••••' in str(d['proxy_url']):d.pop('proxy_url')
     return save_settings(d)
+@app.get('/api/admin/cookies',dependencies=[Depends(auth)])
 @app.get('/api/cookies',dependencies=[Depends(auth)])
 def cookies():
     with con() as c:return [dict(x) for x in c.execute('SELECT id,platform,label,name,created FROM cookies ORDER BY created DESC')]
+@app.post('/api/admin/cookies',dependencies=[Depends(auth)])
 @app.post('/api/cookies',dependencies=[Depends(auth)])
 async def upload(platform:str,label:str,file:UploadFile=File(...)):
     b=await file.read(2097153)
@@ -490,6 +804,7 @@ async def upload(platform:str,label:str,file:UploadFile=File(...)):
     i=uuid.uuid4().hex;p=CK/(i+'.enc');p.write_bytes(F.encrypt(b))
     with con() as c:c.execute('INSERT INTO cookies VALUES(?,?,?,?,?,?)',(i,platform[:100],label[:100],str(p),(file.filename or 'cookies.txt')[:255],now()))
     return {'id':i}
+@app.delete('/api/admin/cookies/{i}',dependencies=[Depends(auth)])
 @app.delete('/api/cookies/{i}',dependencies=[Depends(auth)])
 def dc(i):
     with con() as c:r=c.execute('SELECT path FROM cookies WHERE id=?',(i,)).fetchone();Path(r['path']).unlink(missing_ok=True) if r else None;c.execute('DELETE FROM cookies WHERE id=?',(i,))

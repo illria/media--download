@@ -1,4 +1,8 @@
 (() => {
+  const adminHeaders = (json = false) => ({
+    ...(json ? {'Content-Type': 'application/json'} : {}),
+    ...(localStorage.mediaToken ? {Authorization: `Bearer ${localStorage.mediaToken}`} : {}),
+  });
   const subtitleButton = () => [...document.querySelectorAll('.quick button')]
     .find((button) => button.textContent.includes('字幕'));
 
@@ -29,7 +33,7 @@
       if (!confirm('确定清除硅基流动 API Key？')) return;
       const response = await fetch('/api/transcription/settings', {
         method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
+        headers: adminHeaders(true),
         body: JSON.stringify({clear: true}),
       });
       if (!response.ok) return alert('清除失败');
@@ -43,7 +47,7 @@
     const status = document.getElementById('siliconflowStatus');
     if (!status) return;
     try {
-      const response = await fetch('/api/transcription/settings', {cache: 'no-store'});
+      const response = await fetch('/api/transcription/settings', {cache: 'no-store', headers: adminHeaders()});
       if (!response.ok) throw new Error('读取失败');
       const data = await response.json();
       status.textContent = data.configured
@@ -68,7 +72,7 @@
       if (apiKey) {
         const response = await fetch('/api/transcription/settings', {
           method: 'PUT',
-          headers: {'Content-Type': 'application/json'},
+          headers: adminHeaders(true),
           body: JSON.stringify({api_key: apiKey}),
         });
         if (!response.ok) return alert('硅基流动 API Key 保存失败');

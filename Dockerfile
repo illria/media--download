@@ -29,11 +29,8 @@ COPY youtube_hotfix.py ./
 COPY subtitle_feature.py ./
 COPY final_app.py ./
 COPY static ./static
-COPY strip_auth.py ./
 
-RUN python strip_auth.py \
-    && rm strip_auth.py \
-    && mkdir -p /data/database /data/downloads /data/temp /data/cookies /data/home
+RUN mkdir -p /data/database /data/downloads /data/temp /data/cookies /data/home
 
 EXPOSE 19190
 STOPSIGNAL SIGTERM
