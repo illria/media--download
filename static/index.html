@@ -10,13 +10,13 @@
 <section id="page-cookies" class="section"><div class="card"><h2>Cookie 管理</h2><p class="muted">YouTube 数据中心 IP 被限制时，请上传浏览器导出的 Netscape cookies.txt。</p><form id="cookieForm"><div class="settings"><label>平台<input id="cookiePlatform" value="youtube"></label><label>备注<input id="cookieLabel" placeholder="我的 YouTube Cookie"></label></div><input id="cookieFile" type="file" accept=".txt" style="margin-top:12px"><br><button class="btn blue" style="margin-top:12px">上传</button></form><div id="cookieList"></div></div></section>
 <section id="page-settings" class="section"><div class="card"><h2>系统设置</h2><div class="settings"><label>最大文件 GB<input id="maxFile" type="number"></label><label>最高分辨率<input id="maxRes" type="number"></label><label>保留小时<input id="retention" type="number"></label><label>最低剩余空间 GB<input id="minFree" type="number"></label><label>请求间隔秒<input id="sleep" type="number"></label><label>代理<input id="proxy" placeholder="socks5h://user:pass@host:port"></label></div><button id="saveSettings" class="btn blue" style="margin-top:16px">保存</button><span id="settingsMsg" class="good"></span></div></section>
 </main></div></div><script>
-const $=x=>document.getElementById(x);let token=localStorage.mediaToken||'',setup=false,probe=null,timer=null;
+const $=x=>document.getElementById(x);let token=localStorage.mediaToken||'',setup=false,probe=null,timer=null;const koofrStatusCache=new Map();
 async function api(p,o={}){o.headers={...(o.headers||{}),...(token?{Authorization:`Bearer ${token}`}:{})};if(o.body&&!(o.body instanceof FormData)){o.headers['Content-Type']='application/json';o.body=JSON.stringify(o.body)}const r=await fetch(p,o);let d;try{d=await r.json()}catch{d={detail:await r.text()}}if(!r.ok){if(r.status===401){token='';localStorage.removeItem('mediaToken');$('auth').classList.remove('hidden')}throw new Error(typeof d.detail==='string'?d.detail:(d.detail?.message||JSON.stringify(d.detail)))}return d}
 function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function fmt(n){if(!n)return'';for(const u of ['B','KB','MB','GB']){if(n<1024)return n.toFixed(1)+' '+u;n/=1024}return n.toFixed(1)+' TB'}
 async function init(){const s=await api('/api/auth/status');setup=s.setup_required;$('authTitle').textContent=setup?'首次初始化':'管理员登录';$('authText').textContent=setup?'设置至少 8 位管理员密码':'输入管理员密码';if(token){$('auth').classList.add('hidden');boot()}}
 $('authBtn').onclick=async()=>{try{const d=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:{password:$('password').value}});token=d.token;localStorage.mediaToken=token;$('auth').classList.add('hidden');boot()}catch(e){$('authError').textContent=e.message}};function logout(){token='';localStorage.removeItem('mediaToken');$('auth').classList.remove('hidden')}
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));$(`page-${b.dataset.page}`).classList.add('active');if(b.dataset.page==='tasks')loadTasks();if(b.dataset.page==='cookies')loadCookies();if(b.dataset.page==='settings')loadSettings()});
-async function boot(){await Promise.all([health(),loadCookies(),loadTasks()]);clearInterval(timer);timer=setInterval(()=>{health();loadTasks(false)},3000)}async function health(){try{const h=await api('/api/health');$('health').textContent=h.ok?'系统正常 · 19190':'组件缺失';$('health').className='pill '+(h.ok?'good':'error')}catch{$('health').textContent='连接失败'}}
+async function boot(){await Promise.all([health(),loadCookies(),loadTasks(false)]);clearInterval(timer);timer=setInterval(()=>{health();loadTasks(false)},3000)}async function health(){try{const h=await api('/api/health');$('health').textContent=h.ok?'系统正常 · 19190':'组件缺失';$('health').className='pill '+(h.ok?'good':'error')}catch{$('health').textContent='连接失败'}}
 $('probeBtn').onclick=async()=>{try{$('probeBtn').disabled=true;$('probeError').textContent='正在解析……';probe=await api('/api/probe',{method:'POST',body:{url:$('url').value,cookie_id:$('probeCookie').value||null}});$('probeError').textContent='';$('result').classList.remove('hidden');$('title').textContent=probe.title||'未命名媒体';$('summary').textContent=`平台：${probe.platform||'-'} · 作者：${probe.uploader||'-'} · 时长：${probe.duration?Math.round(probe.duration/60)+' 分钟':'未知'} · 字幕：${probe.subtitles.length}`;$('formats').innerHTML=(probe.video_options||[]).map(f=>`<button class="format" onclick='videoFormat(${JSON.stringify(f)})'>${esc(f.label)} (.${esc(f.ext)}) ${f.has_audio?'🔊':'🔇'}<small>${f.filesize?fmt(f.filesize):''}</small></button>`).join('')||'<p>没有可用的视频格式</p>'}catch(e){$('probeError').textContent=e.message}finally{$('probeBtn').disabled=false}};
 async function createTask(mode,opt={}){if(!probe)return;try{await api('/api/tasks',{method:'POST',body:{url:probe.webpage_url,title:probe.title,platform:probe.platform,options:{mode,engine:mode==='live'?'streamlink':'auto',resolution:opt.height||1080,format_id:opt.format_id||null,format_has_audio:!!opt.has_audio,audio_format:mode==='audio'?'mp3':'original',write_thumbnail:false,embed_metadata:true,cookie_id:$('probeCookie').value||null,subtitle_languages:['zh-CN','zh','en'],stream_quality:'best'}}});document.querySelector('[data-page="tasks"]').click()}catch(e){alert(e.message)}}function quick(m){createTask(m)}function videoFormat(f){createTask('video',f)}
 function inlineArg(v){return esc(JSON.stringify(String(v??'')))}
@@ -54,14 +54,14 @@ function taskFileArea(t){
 async function loadTasks(render=true){
     if(!token)return;
     try{
-        const a=await api('/api/tasks');
+        const a=await api(render?'/api/tasks?include_koofr=1':'/api/tasks');
         if(!render&&!document.querySelector('[data-page="tasks"]').classList.contains('active'))return;
-        const tasks=await Promise.all(a.map(async t=>{
-            if(['completed','expired'].includes(t.status)){
-                try{t.koofr=await api(`/api/tasks/${encodeURIComponent(t.id)}/koofr-status`)}catch{t.koofr={saved:false,path:'',files:[],size:0}}
-            }
+        const tasks=a.map(t=>{
+            const id=String(t.id||'');
+            if(t.koofr)koofrStatusCache.set(id,t.koofr);
+            else if(koofrStatusCache.has(id))t.koofr=koofrStatusCache.get(id);
             return t;
-        }));
+        });
         $('taskList').innerHTML=tasks.map(t=>`<div class="task"><div class="row space"><strong>${esc(t.title||t.url)}</strong><span>${esc(t.status)}</span></div><div class="progress"><span style="width:${Math.max(0,Math.min(100,t.progress||0))}%"></span></div><div class="row"><span>${Number(t.progress||0).toFixed(1)}%</span><span class="muted">${esc(t.speed||'')}</span>${['queued','downloading'].includes(t.status)?`<button class="btn danger" onclick="act(${inlineArg(t.id)},'cancel')">取消</button>`:''}${['failed','cancelled'].includes(t.status)?`<button class="btn ghost" onclick="act(${inlineArg(t.id)},'retry')">重试</button>`:''}<button class="btn danger" onclick="del(${inlineArg(t.id)})">删除</button></div>${taskFileArea(t)}${t.error_message?`<p class="error">${esc(t.error_code)}：${esc(t.error_message)}</p>`:''}${t.log_tail?`<details><summary>诊断日志</summary><pre>${esc(t.log_tail)}</pre></details>`:''}</div>`).join('')||'<p class="muted">暂无任务</p>';
     }catch(e){console.error(e)}
 }
@@ -87,6 +87,7 @@ async function saveToKoofr(i,button){
     button.disabled=true;
     try{
         const d=await api(`/api/tasks/${encodeURIComponent(i)}/save-to-koofr`,{method:'POST'});
+        koofrStatusCache.set(String(i),d);
         status.className='good koofr-status';
         status.textContent=`已保存到 Koofr\n云盘路径：${d.path||''}`;
         button.textContent='已保存到 Koofr';
@@ -95,13 +96,20 @@ async function saveToKoofr(i,button){
         status.textContent=e.message;
     }finally{button.disabled=false}
 }
+function responseFileName(response,fallback){
+    const header=response.headers.get('content-disposition')||'';
+    const encoded=header.match(/filename\*=UTF-8''([^;]+)/i);
+    if(encoded){try{return decodeURIComponent(encoded[1].trim().replace(/^"|"$/g,''))}catch{}}
+    const plain=header.match(/filename="?([^";]+)"?/i);
+    return plain?plain[1].trim():fallback;
+}
 async function downloadKoofr(i){
     let r;
     try{r=await fetch(`/api/tasks/${encodeURIComponent(i)}/koofr-download`,{headers:{Authorization:`Bearer ${token}`}})}catch{return alert('Koofr 下载失败')}
     if(!r.ok)return alert('Koofr 副本不存在或下载失败');
     const b=await r.blob(),a=document.createElement('a'),objectUrl=URL.createObjectURL(b);
     a.href=objectUrl;
-    a.download='koofr-files.zip';
+    a.download=responseFileName(r,'koofr-files.zip');
     a.click();
     setTimeout(()=>URL.revokeObjectURL(objectUrl),0);
 }

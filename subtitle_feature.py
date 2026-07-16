@@ -60,23 +60,45 @@ def install(core: Any) -> None:
     def run(command: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
-    def existing_subtitle(task: dict[str, Any], work: Path, cookie: Path | None) -> Path | None:
+    subtitle_suffixes = {".srt", ".vtt", ".ass", ".ssa", ".lrc", ".ttml", ".json", ".txt"}
+
+    def subtitle_files(work: Path) -> list[Path]:
+        return sorted(
+            [path for path in work.iterdir() if path.is_file() and path.suffix.lower() in subtitle_suffixes],
+            key=lambda path: path.name,
+        )
+
+    def existing_subtitles(task: dict[str, Any], work: Path, cookie: Path | None) -> list[Path]:
         command = core.base(task["url"], cookie, False) + [
             "--skip-download", "--write-subs", "--write-auto-subs",
-            "--sub-langs", "zh-CN,zh-Hans,zh-Hant,zh,en",
+            "--sub-langs", "all",
             "--sub-format", "srt/best", "--convert-subs", "srt",
             "--output", str(work / "%(title).150B [%(id)s].%(ext)s"), task["url"],
         ]
         result = run(command, 120)
-        files = sorted(work.glob("*.srt"), key=lambda path: path.stat().st_size, reverse=True)
+        files = subtitle_files(work)
         if files:
-            return files[0]
+            return files
         if result.returncode and core.denied(result.stderr or result.stdout):
             retry = core.base(task["url"], cookie, True) + command[len(core.base(task["url"], cookie, False)):]
             run(retry, 120)
-            files = sorted(work.glob("*.srt"), key=lambda path: path.stat().st_size, reverse=True)
-            return files[0] if files else None
-        return None
+            return subtitle_files(work)
+        return []
+
+    def normalize_subtitles(work: Path, files: list[Path]) -> list[Path]:
+        reserved = set(files)
+        targets: list[Path] = []
+        for source in files:
+            stem, suffix = safe_name(source.stem), source.suffix.lower()
+            target = work / f"{stem}{suffix}"
+            index = 2
+            while (target in reserved and target != source) or target in targets:
+                target = work / f"{stem}-{index}{suffix}"
+                index += 1
+            if source != target:
+                shutil.move(str(source), target)
+            targets.append(target)
+        return targets
 
     def download_audio(task: dict[str, Any], work: Path, cookie: Path | None) -> Path:
         command = core.base(task["url"], cookie, False) + [
@@ -211,12 +233,10 @@ def install(core: Any) -> None:
         try:
             cookie = core.cpath(task["options"].get("cookie_id"))
             core.patch(task_id, status="processing", progress=5, eta="正在检查平台字幕", error_code=None, error_message=None)
-            subtitle = existing_subtitle(task, work, cookie)
-            if subtitle:
-                target = work / f"{safe_name(task.get('title'))}.srt"
-                if subtitle != target:
-                    shutil.move(str(subtitle), target)
-                finish(task, target, [target])
+            subtitles = existing_subtitles(task, work, cookie)
+            if subtitles:
+                outputs = normalize_subtitles(work, subtitles)
+                finish(task, max(outputs, key=lambda path: path.stat().st_size), outputs)
                 return
             key = get_key()
             if not key:

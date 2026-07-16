@@ -315,9 +315,14 @@ async def create(b:Task):
     with con() as c:c.execute('INSERT INTO tasks(id,url,title,platform,status,options,created,updated) VALUES(?,?,?,?,?,?,?,?)',(i,u,b.title,b.platform,'queued',json.dumps(b.options),n,n))
     return row(i)
 @app.get('/api/tasks',dependencies=[Depends(auth)])
-def tasks():
+def tasks(include_koofr:bool=False):
     with con() as c:ids=[x['id'] for x in c.execute('SELECT id FROM tasks ORDER BY created DESC LIMIT 200')]
-    return [row(i) for i in ids]
+    output=[]
+    for i in ids:
+        task=row(i)
+        if task and include_koofr and task['status'] in {'completed','expired'}:task['koofr']=_koofr_payload(task)
+        if task:output.append(task)
+    return output
 @app.post('/api/tasks/{i}/cancel',dependencies=[Depends(auth)])
 def cancel(i):
     t=row(i)
