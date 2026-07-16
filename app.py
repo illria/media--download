@@ -198,7 +198,9 @@ class KoofrError(RuntimeError):
 KOOFR_CATEGORIES={'video':'Videos','audio':'Audio','thumbnail':'Covers','live':'Live','subtitles':'Subtitles'}
 KOOFR_MARKER='.media-download-complete'
 KOOFR_CONTAINER_PATH=Path('/mnt/koofr').resolve()
-KOOFR_REMOTE_FS={'cifs','ceph','davfs','fuse','fuseblk','glusterfs','nfs','nfs4','s3fs','smb3','sshfs','webdav','9p'}
+KOOFR_REMOTE_FS={'fuse.rclone'}
+KOOFR_ROOT_CACHE_TTL=8
+KOOFR_ROOT_CACHE={'key':None,'expires':0.0,'root':None,'error':None,'status_code':503}
 
 def _inside(base:Path,path:Path):
     try:path.relative_to(base);return True
@@ -222,7 +224,7 @@ def _koofr_mount_info(path):
     except (OSError,ValueError):return None
     return best
 
-def _koofr_root():
+def _koofr_root_uncached():
     raw=os.getenv('KOOFR_ROOT','').strip() or '/mnt/koofr/Media-Download'
     host_path=os.getenv('KOOFR_HOST_PATH','').strip() or '/mnt/koofr'
     candidate=Path(raw).expanduser()
@@ -232,19 +234,41 @@ def _koofr_root():
     mount=_koofr_mount_info(root)
     if not mount:raise KoofrError(f'Koofr 未挂载或未能检测到真实挂载，请确认宿主机路径 {host_path} 已挂载',503)
     _,fstype,source=mount
-    remote=fstype in KOOFR_REMOTE_FS or fstype.startswith('fuse.') or any(x in source.lower() for x in ('koofr','rclone','webdav','sshfs'))
+    remote=fstype in KOOFR_REMOTE_FS or any(x in source.lower() for x in ('koofr','rclone'))
     if not remote:raise KoofrError(f'检测到的是本地文件系统（{fstype}），不是 Koofr 挂载',503)
     try:root.mkdir(parents=True,exist_ok=True)
     except OSError as exc:raise KoofrError(f'Koofr 项目目录创建失败：{exc}',503)
     if not root.is_dir() or not os.access(root,os.R_OK|os.W_OK|os.X_OK):raise KoofrError(f'Koofr 根目录不可写：{root}',503)
     return root
 
-def _koofr_target(task):
+def _koofr_root(force=False):
+    key=(os.getenv('KOOFR_ROOT','').strip(),os.getenv('KOOFR_HOST_PATH','').strip())
+    current=time.monotonic()
+    if not force:
+        with LOCK:
+            if KOOFR_ROOT_CACHE['key']==key and KOOFR_ROOT_CACHE['expires']>current:
+                if KOOFR_ROOT_CACHE['error']:raise KoofrError(KOOFR_ROOT_CACHE['error'],KOOFR_ROOT_CACHE['status_code'])
+                return KOOFR_ROOT_CACHE['root']
+    try:root=_koofr_root_uncached()
+    except KoofrError as exc:
+        with LOCK:KOOFR_ROOT_CACHE.update(key=key,expires=time.monotonic()+KOOFR_ROOT_CACHE_TTL,root=None,error=str(exc),status_code=exc.status_code)
+        raise
+    with LOCK:KOOFR_ROOT_CACHE.update(key=key,expires=time.monotonic()+KOOFR_ROOT_CACHE_TTL,root=root,error=None,status_code=503)
+    return root
+
+def _koofr_health():
+    try:
+        root=_koofr_root();usage=shutil.disk_usage(root)
+        return {'mounted':True,'writable':True,'root':str(root),'total':usage.total,'free':usage.free,'error':''}
+    except (KoofrError,OSError) as exc:
+        return {'mounted':False,'writable':False,'root':'','total':0,'free':0,'error':str(exc)}
+
+def _koofr_target(task,force_mount_check=False):
     task_id=str(task.get('id') or '')
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',task_id):raise KoofrError('任务目录标识无效')
     mode=str((task.get('options') or {}).get('mode') or 'video')
     category=KOOFR_CATEGORIES.get(mode,KOOFR_CATEGORIES['video'])
-    root=_koofr_root();target=(root/category/task_id).resolve()
+    root=_koofr_root(force=force_mount_check);target=(root/category/task_id).resolve()
     if not _inside(root,target):raise KoofrError('Koofr 目标路径非法')
     return root,target
 
@@ -281,7 +305,7 @@ def save_task_to_koofr(task_id,allow_processing_subtitles=False):
     if not task:raise KoofrError('任务不存在',404)
     processing_subtitles=task['status']=='processing' and (task.get('options') or {}).get('mode')=='subtitles'
     if task['status'] not in {'completed','expired'} and not (allow_processing_subtitles and processing_subtitles):raise KoofrError('只有 completed 或 expired 任务可以保存到 Koofr')
-    _,sources=_local_output_files(task_id);root,target=_koofr_target(task)
+    _,sources=_local_output_files(task_id);root,target=_koofr_target(task,force_mount_check=True)
     total=sum(path.stat().st_size for _,path in sources)
     try:
         target.mkdir(parents=True,exist_ok=True);target=target.resolve()
@@ -322,7 +346,7 @@ async def life(_):
 app=FastAPI(lifespan=life)
 @app.get('/api/health')
 def health():
-    u=shutil.disk_usage(ROOT);tools={n:bool(shutil.which(n)) for n in ('yt-dlp','streamlink','ffmpeg','deno')};return {'ok':all(tools.values()),'port':PORT,'tools':tools,'disk':{'total':u.total,'used':u.used,'free':u.free,'percent':round(u.used/u.total*100,1)}}
+    u=shutil.disk_usage(ROOT);tools={n:bool(shutil.which(n)) for n in ('yt-dlp','streamlink','ffmpeg','deno')};return {'ok':all(tools.values()),'port':PORT,'tools':tools,'disk':{'total':u.total,'used':u.used,'free':u.free,'percent':round(u.used/u.total*100,1)},'koofr':_koofr_health()}
 @app.get('/api/auth/status')
 def ast():return {'setup_required':not bool(meta('password'))}
 @app.post('/api/auth/setup')
@@ -387,7 +411,7 @@ def koofr_status(i):
 def koofr_download(i):
     task=row(i)
     if not task:raise HTTPException(404,'任务不存在')
-    try:root,target=_koofr_target(task);files=_koofr_files(target)
+    try:root,target=_koofr_target(task,force_mount_check=True);files=_koofr_files(target)
     except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
     if not files:raise HTTPException(404,'Koofr 副本不存在')
     if len(files)==1:return FileResponse(files[0][1],filename=files[0][1].name)
