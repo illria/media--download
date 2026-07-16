@@ -51,8 +51,18 @@ Koofr 是可选挂载。默认宿主机路径是 `/mnt/koofr`，项目目录是
 KOOFR_HOST_PATH=/实际的宿主机挂载路径
 ```
 
-容器会根据 `KOOFR_CONTAINER_PATH`、`KOOFR_SUBPATH` 和 `KOOFR_ROOT` 自动检查当前可用目录；
-挂载完成后无需重新构建镜像。
+容器内固定将宿主机源绑定到 `/mnt/koofr`，应用只接受位于该目录内的
+`KOOFR_ROOT`，并检查 `/proc/self/mountinfo` 中的远程/FUSE 文件系统类型。
+普通 VPS 本地目录不会被当成 Koofr。首次检测到真实挂载时，会自动创建
+`Media-Download` 项目目录。
+
+修改 `.env` 中的挂载源或 `KOOFR_ROOT` 后，需要重新创建容器：
+
+```bash
+docker compose up -d --force-recreate
+```
+
+不需要重新构建镜像。
 
 查看运行状态：
 

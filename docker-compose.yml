@@ -26,14 +26,13 @@ services:
       POT_PROVIDER_URL: "http://youtube-pot-provider:4416"
       COOKIE_ENCRYPTION_KEY: "${COOKIE_ENCRYPTION_KEY:-}"
       SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
-      KOOFR_CONTAINER_PATH: "${KOOFR_CONTAINER_PATH:-/mnt/koofr}"
-      KOOFR_SUBPATH: "${KOOFR_SUBPATH:-Media-Download}"
+      KOOFR_HOST_PATH: "${KOOFR_HOST_PATH:-/mnt/koofr}"
       KOOFR_ROOT: "${KOOFR_ROOT:-/mnt/koofr/Media-Download}"
     volumes:
       - ./data-v2:/data
       - type: bind
         source: "${KOOFR_HOST_PATH:-/mnt/koofr}"
-        target: "${KOOFR_CONTAINER_PATH:-/mnt/koofr}"
+        target: /mnt/koofr
         bind:
           propagation: rslave
           create_host_path: true

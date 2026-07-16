@@ -197,30 +197,47 @@ class KoofrError(RuntimeError):
 
 KOOFR_CATEGORIES={'video':'Videos','audio':'Audio','thumbnail':'Covers','live':'Live','subtitles':'Subtitles'}
 KOOFR_MARKER='.media-download-complete'
+KOOFR_CONTAINER_PATH=Path('/mnt/koofr').resolve()
+KOOFR_REMOTE_FS={'cifs','ceph','davfs','fuse','fuseblk','glusterfs','nfs','nfs4','s3fs','smb3','sshfs','webdav','9p'}
 
 def _inside(base:Path,path:Path):
     try:path.relative_to(base);return True
     except ValueError:return False
 
+def _mount_unescape(value):
+    return re.sub(r'\\([0-7]{3})',lambda m:chr(int(m.group(1),8)),value)
+
+def _koofr_mount_info(path):
+    mountinfo=Path('/proc/self/mountinfo')
+    if not mountinfo.is_file():return None
+    target=path.resolve();best=None
+    try:
+        for line in mountinfo.read_text(encoding='utf-8').splitlines():
+            if ' - ' not in line:continue
+            left,right=line.split(' - ',1);fields=left.split();details=right.split()
+            if len(fields)<6 or len(details)<2:continue
+            mount_point=Path(_mount_unescape(fields[4])).resolve()
+            if _inside(mount_point,target) and (best is None or len(mount_point.parts)>len(best[0].parts)):
+                best=(mount_point,details[0],details[1])
+    except (OSError,ValueError):return None
+    return best
+
 def _koofr_root():
-    configured=os.getenv('KOOFR_ROOT','').strip()
-    container=Path(os.getenv('KOOFR_CONTAINER_PATH','/mnt/koofr')).expanduser()
-    subpath=os.getenv('KOOFR_SUBPATH','Media-Download').strip().strip('/\\')
-    candidates=[]
-    if configured:candidates.append(Path(configured))
-    if subpath:candidates.append(container/subpath)
-    candidates.append(Path('/mnt/koofr/Media-Download'))
-    seen=set()
-    for candidate in candidates:
-        try:root=candidate.resolve()
-        except OSError:continue
-        if root in seen:continue
-        seen.add(root)
-        if not root.exists() or not root.is_dir():continue
-        if not os.access(root,os.R_OK|os.W_OK|os.X_OK):raise KoofrError(f'Koofr 根目录不可写：{root}',503)
-        return root
-    hint='请先挂载 Koofr，并确认项目目录 Media-Download 存在'
-    raise KoofrError(f'Koofr 未挂载或根目录不存在（检查 KOOFR_HOST_PATH/KOOFR_ROOT）；{hint}',503)
+    raw=os.getenv('KOOFR_ROOT','').strip() or '/mnt/koofr/Media-Download'
+    host_path=os.getenv('KOOFR_HOST_PATH','').strip() or '/mnt/koofr'
+    candidate=Path(raw).expanduser()
+    if not candidate.is_absolute():raise KoofrError('KOOFR_ROOT 必须是容器内绝对路径',503)
+    root=candidate.resolve()
+    if not _inside(KOOFR_CONTAINER_PATH,root):raise KoofrError('KOOFR_ROOT 必须位于 /mnt/koofr 挂载目录内',503)
+    mount=_koofr_mount_info(root)
+    if not mount:raise KoofrError(f'Koofr 未挂载或未能检测到真实挂载，请确认宿主机路径 {host_path} 已挂载',503)
+    _,fstype,source=mount
+    remote=fstype in KOOFR_REMOTE_FS or fstype.startswith('fuse.') or any(x in source.lower() for x in ('koofr','rclone','webdav','sshfs'))
+    if not remote:raise KoofrError(f'检测到的是本地文件系统（{fstype}），不是 Koofr 挂载',503)
+    try:root.mkdir(parents=True,exist_ok=True)
+    except OSError as exc:raise KoofrError(f'Koofr 项目目录创建失败：{exc}',503)
+    if not root.is_dir() or not os.access(root,os.R_OK|os.W_OK|os.X_OK):raise KoofrError(f'Koofr 根目录不可写：{root}',503)
+    return root
 
 def _koofr_target(task):
     task_id=str(task.get('id') or '')
