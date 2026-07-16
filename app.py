@@ -201,7 +201,7 @@ KOOFR_CONTAINER_PATH=Path('/mnt/koofr').resolve()
 KOOFR_REMOTE_FS={'fuse.rclone'}
 KOOFR_ROOT_CACHE_TTL=8
 KOOFR_ROOT_CACHE={'key':None,'expires':0.0,'root':None,'error':None,'status_code':503}
-KOOFR_HEALTH_CACHE_TTL=8
+KOOFR_HEALTH_CACHE_TTL=60
 KOOFR_HEALTH_CACHE={'key':None,'expires':0.0,'value':None}
 
 def _inside(base:Path,path:Path):
@@ -263,10 +263,21 @@ def _koofr_write_probe(root):
     try:
         with probe.open('xb') as handle:
             handle.write(b'ok');handle.flush();os.fsync(handle.fileno())
-    except OSError as exc:raise KoofrError(f'Koofr 实际写入测试失败：{exc}',503)
-    finally:
+    except OSError as exc:
         try:probe.unlink(missing_ok=True)
-        except OSError:pass
+        except OSError as cleanup_exc:
+            try:probe.unlink(missing_ok=True)
+            except OSError as retry_exc:
+                raise KoofrError(f'Koofr 实际写入测试失败：{exc}；测试文件清理失败，残留路径：{probe}（首次：{cleanup_exc}；重试：{retry_exc}）',503)
+            raise KoofrError(f'Koofr 实际写入测试失败：{exc}；测试文件首次清理失败但重试成功：{probe}（{cleanup_exc}）',503)
+        raise KoofrError(f'Koofr 实际写入测试失败：{exc}',503)
+    try:
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        try:probe.unlink(missing_ok=True)
+        except OSError as retry_exc:
+            raise KoofrError(f'Koofr 测试文件删除失败，残留路径：{probe}（首次：{exc}；重试：{retry_exc}）',503)
+        raise KoofrError(f'Koofr 测试文件首次删除失败但重试成功：{probe}（{exc}）',503)
 
 def _koofr_health():
     key=(os.getenv('KOOFR_ROOT','').strip(),os.getenv('KOOFR_HOST_PATH','').strip())
@@ -274,10 +285,15 @@ def _koofr_health():
     with LOCK:
         if KOOFR_HEALTH_CACHE['key']==key and KOOFR_HEALTH_CACHE['expires']>current and KOOFR_HEALTH_CACHE['value'] is not None:return dict(KOOFR_HEALTH_CACHE['value'])
     try:
-        root=_koofr_root();_koofr_write_probe(root);usage=shutil.disk_usage(root)
-        value={'mounted':True,'writable':True,'root':str(root),'total':usage.total,'free':usage.free,'error':''}
+        root=_koofr_root()
     except (KoofrError,OSError) as exc:
         value={'mounted':False,'writable':False,'root':'','total':0,'free':0,'error':str(exc)}
+    else:
+        try:
+            _koofr_write_probe(root);usage=shutil.disk_usage(root)
+            value={'mounted':True,'writable':True,'root':str(root),'total':usage.total,'free':usage.free,'error':''}
+        except (KoofrError,OSError) as exc:
+            value={'mounted':True,'writable':False,'root':str(root),'total':0,'free':0,'error':str(exc)}
     with LOCK:KOOFR_HEALTH_CACHE.update(key=key,expires=time.monotonic()+KOOFR_HEALTH_CACHE_TTL,value=value)
     return dict(value)
 
@@ -434,6 +450,7 @@ def koofr_download(i):
     if not task:raise HTTPException(404,'任务不存在')
     try:root,target=_koofr_target(task,force_mount_check=True);files=_koofr_files(target)
     except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
+    except OSError as exc:raise HTTPException(503,f'Koofr 连接中断，请检查挂载后重试：{exc}')
     if not files:raise HTTPException(404,'Koofr 副本不存在')
     if len(files)==1:return FileResponse(files[0][1],filename=files[0][1].name)
     fd,archive=tempfile.mkstemp(prefix=f'koofr-{i}-',suffix='.zip',dir=str(TMP));os.close(fd);archive_path=Path(archive)
@@ -442,6 +459,10 @@ def koofr_download(i):
             for relative,path in files:
                 if not _inside(target,path.resolve()):raise KoofrError('Koofr 副本包含非法路径')
                 bundle.write(path,arcname=str(relative))
+    except KoofrError as exc:
+        archive_path.unlink(missing_ok=True);raise HTTPException(exc.status_code,str(exc))
+    except OSError as exc:
+        archive_path.unlink(missing_ok=True);raise HTTPException(503,f'Koofr 连接中断，请检查挂载后重试：{exc}')
     except Exception:
         archive_path.unlink(missing_ok=True);raise HTTPException(500,'Koofr 副本打包失败')
     return FileResponse(archive_path,filename=_koofr_zip_name(task),background=BackgroundTask(archive_path.unlink,missing_ok=True))
