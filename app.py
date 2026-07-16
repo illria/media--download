@@ -204,6 +204,9 @@ KOOFR_ROOT_CACHE={'key':None,'expires':0.0,'root':None,'error':None,'status_code
 KOOFR_HEALTH_CACHE_TTL=60
 KOOFR_HEALTH_CACHE={'key':None,'expires':0.0,'value':None}
 
+def _invalidate_koofr_health():
+    with LOCK:KOOFR_HEALTH_CACHE.update(key=None,expires=0.0,value=None)
+
 def _inside(base:Path,path:Path):
     try:path.relative_to(base);return True
     except ValueError:return False
@@ -285,7 +288,7 @@ def _koofr_health():
     with LOCK:
         if KOOFR_HEALTH_CACHE['key']==key and KOOFR_HEALTH_CACHE['expires']>current and KOOFR_HEALTH_CACHE['value'] is not None:return dict(KOOFR_HEALTH_CACHE['value'])
     try:
-        root=_koofr_root()
+        root=_koofr_root(force=True)
     except (KoofrError,OSError) as exc:
         value={'mounted':False,'writable':False,'root':'','total':0,'free':0,'error':str(exc)}
     else:
@@ -367,6 +370,7 @@ def auto_save_subtitles_to_koofr(task_id):
             message=f'字幕下载完成，但保存到 Koofr 失败：{str(exc)}'
             old=str(task.get('log_tail') or '')
             if message not in old:patch(task_id,log_tail=(old+'\n[Koofr] '+message)[-12000:])
+    finally:_invalidate_koofr_health()
 
 def _koofr_zip_name(task):
     name=re.sub(r'[\\/:*?"<>|\r\n]+','_',str(task.get('title') or 'media'))
@@ -439,6 +443,7 @@ def download(i):
 def save_koofr(i):
     try:return save_task_to_koofr(i)
     except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
+    finally:_invalidate_koofr_health()
 @app.get('/api/tasks/{i}/koofr-status',dependencies=[Depends(auth)])
 def koofr_status(i):
     t=row(i)
@@ -446,26 +451,28 @@ def koofr_status(i):
     return _koofr_payload(t)
 @app.get('/api/tasks/{i}/koofr-download',dependencies=[Depends(auth)])
 def koofr_download(i):
-    task=row(i)
-    if not task:raise HTTPException(404,'任务不存在')
-    try:root,target=_koofr_target(task,force_mount_check=True);files=_koofr_files(target)
-    except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
-    except OSError as exc:raise HTTPException(503,f'Koofr 连接中断，请检查挂载后重试：{exc}')
-    if not files:raise HTTPException(404,'Koofr 副本不存在')
-    if len(files)==1:return FileResponse(files[0][1],filename=files[0][1].name)
-    fd,archive=tempfile.mkstemp(prefix=f'koofr-{i}-',suffix='.zip',dir=str(TMP));os.close(fd);archive_path=Path(archive)
     try:
-        with zipfile.ZipFile(archive_path,'w',zipfile.ZIP_DEFLATED) as bundle:
-            for relative,path in files:
-                if not _inside(target,path.resolve()):raise KoofrError('Koofr 副本包含非法路径')
-                bundle.write(path,arcname=str(relative))
-    except KoofrError as exc:
-        archive_path.unlink(missing_ok=True);raise HTTPException(exc.status_code,str(exc))
-    except OSError as exc:
-        archive_path.unlink(missing_ok=True);raise HTTPException(503,f'Koofr 连接中断，请检查挂载后重试：{exc}')
-    except Exception:
-        archive_path.unlink(missing_ok=True);raise HTTPException(500,'Koofr 副本打包失败')
-    return FileResponse(archive_path,filename=_koofr_zip_name(task),background=BackgroundTask(archive_path.unlink,missing_ok=True))
+        task=row(i)
+        if not task:raise HTTPException(404,'任务不存在')
+        try:root,target=_koofr_target(task,force_mount_check=True);files=_koofr_files(target)
+        except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
+        except OSError as exc:raise HTTPException(503,f'Koofr 连接中断，请检查挂载后重试：{exc}')
+        if not files:raise HTTPException(404,'Koofr 副本不存在')
+        if len(files)==1:return FileResponse(files[0][1],filename=files[0][1].name)
+        fd,archive=tempfile.mkstemp(prefix=f'koofr-{i}-',suffix='.zip',dir=str(TMP));os.close(fd);archive_path=Path(archive)
+        try:
+            with zipfile.ZipFile(archive_path,'w',zipfile.ZIP_DEFLATED) as bundle:
+                for relative,path in files:
+                    if not _inside(target,path.resolve()):raise KoofrError('Koofr 副本包含非法路径')
+                    bundle.write(path,arcname=str(relative))
+        except KoofrError as exc:
+            archive_path.unlink(missing_ok=True);raise HTTPException(exc.status_code,str(exc))
+        except OSError as exc:
+            archive_path.unlink(missing_ok=True);raise HTTPException(503,f'Koofr 连接中断，请检查挂载后重试：{exc}')
+        except Exception:
+            archive_path.unlink(missing_ok=True);raise HTTPException(500,'Koofr 副本打包失败')
+        return FileResponse(archive_path,filename=_koofr_zip_name(task),background=BackgroundTask(archive_path.unlink,missing_ok=True))
+    finally:_invalidate_koofr_health()
 @app.get('/api/settings',dependencies=[Depends(auth)])
 def gs():
     d=settings();p=d.get('proxy_url','');d['proxy_url']=p[:12]+'••••' if p else '';return d
