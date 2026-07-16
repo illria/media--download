@@ -1,7 +1,9 @@
 (() => {
-  const authHeaders = () => {
-    const value = localStorage.mediaToken || '';
-    return value ? { Authorization: `Bearer ${value}` } : {};
+  let busy = false;
+
+  const headers = () => {
+    const token = localStorage.mediaToken || '';
+    return token ? { Authorization: `Bearer ${token}` } : {};
   };
 
   const formatBytes = value => {
@@ -14,4 +16,4 @@
     return `${size.toFixed(1)} TB`;
   };
 
-  const addText = (parent
+  const addText
