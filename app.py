@@ -247,10 +247,11 @@ def _koofr_payload(task):
     files=_koofr_files(target);size=sum(path.stat().st_size for _,path in files)
     return {'saved':bool(files) and (target/KOOFR_MARKER).is_file(),'path':str(target) if files else '','files':[str(rel) for rel,_ in files],'size':size}
 
-def save_task_to_koofr(task_id):
+def save_task_to_koofr(task_id,allow_processing_subtitles=False):
     task=row(task_id)
     if not task:raise KoofrError('任务不存在',404)
-    if task['status'] not in {'completed','expired'}:raise KoofrError('只有 completed 或 expired 任务可以保存到 Koofr')
+    processing_subtitles=task['status']=='processing' and (task.get('options') or {}).get('mode')=='subtitles'
+    if task['status'] not in {'completed','expired'} and not (allow_processing_subtitles and processing_subtitles):raise KoofrError('只有 completed 或 expired 任务可以保存到 Koofr')
     _,sources=_local_output_files(task_id);root,target=_koofr_target(task)
     total=sum(path.stat().st_size for _,path in sources)
     try:
@@ -269,7 +270,7 @@ def save_task_to_koofr(task_id):
     return _koofr_payload(task)
 
 def auto_save_subtitles_to_koofr(task_id):
-    try:save_task_to_koofr(task_id)
+    try:save_task_to_koofr(task_id,allow_processing_subtitles=True)
     except Exception as exc:
         task=row(task_id)
         if task:

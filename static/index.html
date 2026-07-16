@@ -61,7 +61,7 @@ async function loadTasks(render=true){
             const id=String(t.id||'');
             const previous=taskStatusCache.get(id);
             if(t.koofr)koofrStatusCache.set(id,t.koofr);
-            if(t.status==='completed'&&['processing','downloading'].includes(previous)&&!koofrStatusInFlight.has(id)){
+            if(t.status==='completed'&&previous&&previous!=='completed'&&!koofrStatusInFlight.has(id)){
                 koofrStatusInFlight.add(id);
                 statusRefreshes.push(api(`/api/tasks/${encodeURIComponent(id)}/koofr-status`).then(status=>koofrStatusCache.set(id,status)).catch(()=>koofrStatusCache.set(id,{saved:false,path:'',files:[],size:0})).finally(()=>koofrStatusInFlight.delete(id)));
             }

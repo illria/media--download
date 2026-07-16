@@ -218,10 +218,11 @@ def install(core: Any) -> None:
             if source == primary:
                 primary_target = target
         shutil.rmtree(core.TMP / task["id"], ignore_errors=True)
-        core.patch(task["id"], status="completed", progress=100, eta="", output_path=str(primary_target), output_size=total_size, finished=core.now())
+        core.patch(task["id"], progress=100, eta="", output_path=str(primary_target), output_size=total_size)
         auto_save = getattr(core, "auto_save_subtitles_to_koofr", None)
         if auto_save:
             auto_save(task["id"])
+        core.patch(task["id"], status="completed", progress=100, eta="", finished=core.now())
 
     def subtitle_execute(task_id: str) -> None:
         task = core.row(task_id)
