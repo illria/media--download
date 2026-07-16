@@ -19,7 +19,58 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.quer
 async function boot(){await Promise.all([health(),loadCookies(),loadTasks()]);clearInterval(timer);timer=setInterval(()=>{health();loadTasks(false)},3000)}async function health(){try{const h=await api('/api/health');$('health').textContent=h.ok?'系统正常 · 19190':'组件缺失';$('health').className='pill '+(h.ok?'good':'error')}catch{$('health').textContent='连接失败'}}
 $('probeBtn').onclick=async()=>{try{$('probeBtn').disabled=true;$('probeError').textContent='正在解析……';probe=await api('/api/probe',{method:'POST',body:{url:$('url').value,cookie_id:$('probeCookie').value||null}});$('probeError').textContent='';$('result').classList.remove('hidden');$('title').textContent=probe.title||'未命名媒体';$('summary').textContent=`平台：${probe.platform||'-'} · 作者：${probe.uploader||'-'} · 时长：${probe.duration?Math.round(probe.duration/60)+' 分钟':'未知'} · 字幕：${probe.subtitles.length}`;$('formats').innerHTML=(probe.video_options||[]).map(f=>`<button class="format" onclick='videoFormat(${JSON.stringify(f)})'>${esc(f.label)} (.${esc(f.ext)}) ${f.has_audio?'🔊':'🔇'}<small>${f.filesize?fmt(f.filesize):''}</small></button>`).join('')||'<p>没有可用的视频格式</p>'}catch(e){$('probeError').textContent=e.message}finally{$('probeBtn').disabled=false}};
 async function createTask(mode,opt={}){if(!probe)return;try{await api('/api/tasks',{method:'POST',body:{url:probe.webpage_url,title:probe.title,platform:probe.platform,options:{mode,engine:mode==='live'?'streamlink':'auto',resolution:opt.height||1080,format_id:opt.format_id||null,format_has_audio:!!opt.has_audio,audio_format:mode==='audio'?'mp3':'original',write_thumbnail:false,embed_metadata:true,cookie_id:$('probeCookie').value||null,subtitle_languages:['zh-CN','zh','en'],stream_quality:'best'}}});document.querySelector('[data-page="tasks"]').click()}catch(e){alert(e.message)}}function quick(m){createTask(m)}function videoFormat(f){createTask('video',f)}
-async function loadTasks(render=true){if(!token)return;try{const a=await api('/api/tasks');if(!render&&!document.querySelector('[data-page="tasks"]').classList.contains('active'))return;$('taskList').innerHTML=a.map(t=>`<div class="task"><div class="row space"><strong>${esc(t.title||t.url)}</strong><span>${esc(t.status)}</span></div><div class="progress"><span style="width:${Math.max(0,Math.min(100,t.progress||0))}%"></span></div><div class="row"><span>${Number(t.progress||0).toFixed(1)}%</span><span class="muted">${esc(t.speed||'')}</span>${['queued','downloading'].includes(t.status)?`<button class="btn danger" onclick="act('${t.id}','cancel')">取消</button>`:''}${['failed','cancelled','expired'].includes(t.status)?`<button class="btn ghost" onclick="act('${t.id}','retry')">重试</button>`:''}${t.status==='completed'?`<button class="btn blue" onclick="downloadFile('${t.id}')">下载文件</button>`:''}<button class="btn danger" onclick="del('${t.id}')">删除</button></div>${t.error_message?`<p class="error">${esc(t.error_code)}：${esc(t.error_message)}</p>`:''}${t.log_tail?`<details><summary>诊断日志</summary><pre>${esc(t.log_tail)}</pre></details>`:''}</div>`).join('')||'<p class="muted">暂无任务</p>'}catch(e){console.error(e)}}async function act(i,a){await api(`/api/tasks/${i}/${a}`,{method:'POST'});loadTasks()}async function del(i){if(confirm('确定删除？')){await api(`/api/tasks/${i}`,{method:'DELETE'});loadTasks()}}async function downloadFile(i){const r=await fetch(`/api/tasks/${i}/download`,{headers:{Authorization:`Bearer ${token}`}});if(!r.ok)return alert('下载失败');const b=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='media';a.click()}
+function inlineArg(v){return esc(JSON.stringify(String(v??'')))}
+function fileName(p=''){return String(p||'').split(/[\\/]/).pop()||'下载文件'}
+function reparseTask(encodedUrl){
+    const url=decodeURIComponent(encodedUrl);
+    const nav=document.querySelector('[data-page="new"]');
+    if(nav)nav.click();
+    const input=document.getElementById('url');
+    if(input){
+        input.value=url;
+        input.dispatchEvent(new Event('input',{bubbles:true}));
+        input.focus();
+        input.scrollIntoView({behavior:'smooth',block:'center'});
+    }
+    const error=document.getElementById('probeError');
+    if(error)error.textContent='原文件已清除，请重新点击“开始解析”。';
+}
+function taskFileArea(t){
+    const encodedUrl=encodeURIComponent(t.url||''),sourceArg=inlineArg(encodedUrl);
+    if(t.status==='completed'){
+        const name=fileName(t.output_path),size=fmt(Number(t.output_size||0))||'未知大小';
+        return `<div class="task"><div class="row space"><strong>文件</strong><span class="good">${esc(name)}</span></div><div class="row"><span class="muted">${esc(size)}</span><button class="btn blue" onclick="downloadFile(${inlineArg(t.id)},${sourceArg})">重新下载</button></div><p class="muted">重新下载不会延长保留时间，文件仍会按系统设置自动清理。</p></div>`;
+    }
+    if(t.status==='expired'){
+        return `<div class="task"><div class="row space"><strong>文件</strong><span class="error">文件已自动清除</span></div><p><span class="muted">原解析链接：</span><span>${esc(t.url||'')}</span></p><button class="btn ghost" onclick="reparseTask(${sourceArg})">重新解析</button></div>`;
+    }
+    return '';
+}
+async function loadTasks(render=true){
+    if(!token)return;
+    try{
+        const a=await api('/api/tasks');
+        if(!render&&!document.querySelector('[data-page="tasks"]').classList.contains('active'))return;
+        $('taskList').innerHTML=a.map(t=>`<div class="task"><div class="row space"><strong>${esc(t.title||t.url)}</strong><span>${esc(t.status)}</span></div><div class="progress"><span style="width:${Math.max(0,Math.min(100,t.progress||0))}%"></span></div><div class="row"><span>${Number(t.progress||0).toFixed(1)}%</span><span class="muted">${esc(t.speed||'')}</span>${['queued','downloading'].includes(t.status)?`<button class="btn danger" onclick="act(${inlineArg(t.id)},'cancel')">取消</button>`:''}${['failed','cancelled'].includes(t.status)?`<button class="btn ghost" onclick="act(${inlineArg(t.id)},'retry')">重试</button>`:''}<button class="btn danger" onclick="del(${inlineArg(t.id)})">删除</button></div>${taskFileArea(t)}${t.error_message?`<p class="error">${esc(t.error_code)}：${esc(t.error_message)}</p>`:''}${t.log_tail?`<details><summary>诊断日志</summary><pre>${esc(t.log_tail)}</pre></details>`:''}</div>`).join('')||'<p class="muted">暂无任务</p>';
+    }catch(e){console.error(e)}
+}
+async function act(i,a){await api(`/api/tasks/${i}/${a}`,{method:'POST'});loadTasks()}
+async function del(i){if(confirm('确定删除？')){await api(`/api/tasks/${i}`,{method:'DELETE'});loadTasks()}}
+async function downloadFile(i,encodedSourceUrl){
+    let r;
+    try{r=await fetch(`/api/tasks/${i}/download`,{headers:{Authorization:`Bearer ${token}`}})}catch{return alert('下载失败')}
+    if(r.status===404){
+        alert('文件已被清除或不存在，请使用原链接重新解析。');
+        reparseTask(encodedSourceUrl);
+        return;
+    }
+    if(!r.ok)return alert('下载失败');
+    const b=await r.blob(),a=document.createElement('a'),objectUrl=URL.createObjectURL(b);
+    a.href=objectUrl;
+    a.download='media';
+    a.click();
+    URL.revokeObjectURL(objectUrl);
+}
 async function loadCookies(){if(!token)return;const a=await api('/api/cookies');$('probeCookie').innerHTML='<option value="">不使用 Cookie</option>'+a.map(x=>`<option value="${x.id}">${esc(x.platform)} · ${esc(x.label)}</option>`).join('');$('cookieList').innerHTML=a.map(x=>`<div class="task row space"><span>${esc(x.label)} · ${esc(x.name)}</span><button class="btn danger" onclick="removeCookie('${x.id}')">删除</button></div>`).join('')}
 $('cookieForm').onsubmit=async e=>{e.preventDefault();const f=$('cookieFile').files[0];if(!f)return alert('请选择 Cookie 文件');const d=new FormData();d.append('file',f);await api(`/api/cookies?platform=${encodeURIComponent($('cookiePlatform').value)}&label=${encodeURIComponent($('cookieLabel').value)}`,{method:'POST',body:d});e.target.reset();loadCookies()};async function removeCookie(i){await api(`/api/cookies/${i}`,{method:'DELETE'});loadCookies()}
 async function loadSettings(){const s=await api('/api/settings');$('maxFile').value=s.max_file_size_gb;$('maxRes').value=s.max_resolution;$('retention').value=s.retention_hours;$('minFree').value=s.min_free_gb;$('sleep').value=s.request_sleep_seconds;$('proxy').value=s.proxy_url||''}$('saveSettings').onclick=async()=>{await api('/api/settings',{method:'PUT',body:{max_file_size_gb:+$('maxFile').value,max_resolution:+$('maxRes').value,retention_hours:+$('retention').value,min_free_gb:+$('minFree').value,request_sleep_seconds:+$('sleep').value,proxy_url:$('proxy').value,youtube_compatibility_mode:true}});$('settingsMsg').textContent=' 已保存'};init().catch(e=>$('authError').textContent=e.message)
