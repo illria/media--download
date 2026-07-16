@@ -203,12 +203,24 @@ def _inside(base:Path,path:Path):
     except ValueError:return False
 
 def _koofr_root():
-    raw=os.getenv('KOOFR_ROOT','').strip()
-    if not raw:raise KoofrError('Koofr 未配置，请设置 KOOFR_ROOT',503)
-    root=Path(raw).expanduser().resolve()
-    if not root.exists() or not root.is_dir():raise KoofrError('Koofr 根目录不存在或未挂载',503)
-    if not os.access(root,os.R_OK|os.W_OK|os.X_OK):raise KoofrError('Koofr 根目录不可写',503)
-    return root
+    configured=os.getenv('KOOFR_ROOT','').strip()
+    container=Path(os.getenv('KOOFR_CONTAINER_PATH','/mnt/koofr')).expanduser()
+    subpath=os.getenv('KOOFR_SUBPATH','Media-Download').strip().strip('/\\')
+    candidates=[]
+    if configured:candidates.append(Path(configured))
+    if subpath:candidates.append(container/subpath)
+    candidates.append(Path('/mnt/koofr/Media-Download'))
+    seen=set()
+    for candidate in candidates:
+        try:root=candidate.resolve()
+        except OSError:continue
+        if root in seen:continue
+        seen.add(root)
+        if not root.exists() or not root.is_dir():continue
+        if not os.access(root,os.R_OK|os.W_OK|os.X_OK):raise KoofrError(f'Koofr 根目录不可写：{root}',503)
+        return root
+    hint='请先挂载 Koofr，并确认项目目录 Media-Download 存在'
+    raise KoofrError(f'Koofr 未挂载或根目录不存在（检查 KOOFR_HOST_PATH/KOOFR_ROOT）；{hint}',503)
 
 def _koofr_target(task):
     task_id=str(task.get('id') or '')

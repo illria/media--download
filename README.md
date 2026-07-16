@@ -41,6 +41,19 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+Koofr 是可选挂载。默认宿主机路径是 `/mnt/koofr`，项目目录是
+`/mnt/koofr/Media-Download`。未挂载 Koofr 时，Compose 会使用一个空的可选绑定目录，
+不会阻止镜像构建；任务下载和本地保留功能仍可正常使用，Koofr 操作会提示未挂载。
+
+如果 Koofr 实际挂载在其他宿主机路径，复制 `.env.example` 为 `.env` 后修改：
+
+```dotenv
+KOOFR_HOST_PATH=/实际的宿主机挂载路径
+```
+
+容器会根据 `KOOFR_CONTAINER_PATH`、`KOOFR_SUBPATH` 和 `KOOFR_ROOT` 自动检查当前可用目录；
+挂载完成后无需重新构建镜像。
+
 查看运行状态：
 
 ```bash
