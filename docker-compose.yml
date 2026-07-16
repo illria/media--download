@@ -26,8 +26,14 @@ services:
       POT_PROVIDER_URL: "http://youtube-pot-provider:4416"
       COOKIE_ENCRYPTION_KEY: "${COOKIE_ENCRYPTION_KEY:-}"
       SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
+      KOOFR_ROOT: "/mnt/koofr/Media-Download"
     volumes:
       - ./data-v2:/data
+      - type: bind
+        source: /mnt/koofr
+        target: /mnt/koofr
+        bind:
+          propagation: rslave
     mem_limit: 600m
     pids_limit: 224
     security_opt:

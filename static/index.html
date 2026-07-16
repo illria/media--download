@@ -36,12 +36,17 @@ function reparseTask(encodedUrl){
     if(error)error.textContent='原文件已清除，请重新点击“开始解析”。';
 }
 function taskFileArea(t){
-    const encodedUrl=encodeURIComponent(t.url||''),sourceArg=inlineArg(encodedUrl);
+    const encodedUrl=encodeURIComponent(t.url||''),sourceArg=inlineArg(encodedUrl),idArg=inlineArg(t.id),koofr=t.koofr||{};
     if(t.status==='completed'){
         const name=fileName(t.output_path),size=fmt(Number(t.output_size||0))||'未知大小';
-        return `<div class="task"><div class="row space"><strong>文件</strong><span class="good">${esc(name)}</span></div><div class="row"><span class="muted">${esc(size)}</span><button class="btn blue" onclick="downloadFile(${inlineArg(t.id)},${sourceArg})">重新下载</button></div><p class="muted">重新下载不会延长保留时间，文件仍会按系统设置自动清理。</p></div>`;
+        const subtitleFailure=t.options&&t.options.mode==='subtitles'&&String(t.log_tail||'').includes('字幕下载完成，但保存到 Koofr 失败');
+        const statusClass=koofr.saved?'good':subtitleFailure?'error':'muted';
+        const statusText=koofr.saved?`已保存到 Koofr<br>云盘路径：${esc(koofr.path||'')}`:subtitleFailure?'字幕下载完成，但保存到 Koofr 失败':'';
+        const saveLabel=subtitleFailure?'重新保存到 Koofr':'保存到 Koofr';
+        return `<div class="task task-file"><div class="row space"><strong>文件</strong><span class="good">${esc(name)}</span></div><div class="row"><span class="muted">${esc(size)}</span><button class="btn blue" onclick="downloadFile(${idArg},${sourceArg})">下载文件</button><button class="btn ghost" onclick="saveToKoofr(${idArg},this)">${saveLabel}</button></div><p class="muted">本地文件仍会按系统设置自动清理；下载文件和保存到 Koofr 都不会延长本地保留时间。</p><p class="${statusClass} koofr-status">${statusText}</p></div>`;
     }
     if(t.status==='expired'){
+        if(koofr.saved)return `<div class="task"><div class="row space"><strong>文件</strong><span class="error">文件已自动清除</span></div><p class="good">Koofr 副本仍然存在<br>云盘路径：${esc(koofr.path||'')}</p><button class="btn blue" onclick="downloadKoofr(${idArg})">从 Koofr 下载</button><button class="btn ghost" onclick="reparseTask(${sourceArg})">重新解析</button></div>`;
         return `<div class="task"><div class="row space"><strong>文件</strong><span class="error">文件已自动清除</span></div><p><span class="muted">原解析链接：</span><span>${esc(t.url||'')}</span></p><button class="btn ghost" onclick="reparseTask(${sourceArg})">重新解析</button></div>`;
     }
     return '';
@@ -51,7 +56,13 @@ async function loadTasks(render=true){
     try{
         const a=await api('/api/tasks');
         if(!render&&!document.querySelector('[data-page="tasks"]').classList.contains('active'))return;
-        $('taskList').innerHTML=a.map(t=>`<div class="task"><div class="row space"><strong>${esc(t.title||t.url)}</strong><span>${esc(t.status)}</span></div><div class="progress"><span style="width:${Math.max(0,Math.min(100,t.progress||0))}%"></span></div><div class="row"><span>${Number(t.progress||0).toFixed(1)}%</span><span class="muted">${esc(t.speed||'')}</span>${['queued','downloading'].includes(t.status)?`<button class="btn danger" onclick="act(${inlineArg(t.id)},'cancel')">取消</button>`:''}${['failed','cancelled'].includes(t.status)?`<button class="btn ghost" onclick="act(${inlineArg(t.id)},'retry')">重试</button>`:''}<button class="btn danger" onclick="del(${inlineArg(t.id)})">删除</button></div>${taskFileArea(t)}${t.error_message?`<p class="error">${esc(t.error_code)}：${esc(t.error_message)}</p>`:''}${t.log_tail?`<details><summary>诊断日志</summary><pre>${esc(t.log_tail)}</pre></details>`:''}</div>`).join('')||'<p class="muted">暂无任务</p>';
+        const tasks=await Promise.all(a.map(async t=>{
+            if(['completed','expired'].includes(t.status)){
+                try{t.koofr=await api(`/api/tasks/${encodeURIComponent(t.id)}/koofr-status`)}catch{t.koofr={saved:false,path:'',files:[],size:0}}
+            }
+            return t;
+        }));
+        $('taskList').innerHTML=tasks.map(t=>`<div class="task"><div class="row space"><strong>${esc(t.title||t.url)}</strong><span>${esc(t.status)}</span></div><div class="progress"><span style="width:${Math.max(0,Math.min(100,t.progress||0))}%"></span></div><div class="row"><span>${Number(t.progress||0).toFixed(1)}%</span><span class="muted">${esc(t.speed||'')}</span>${['queued','downloading'].includes(t.status)?`<button class="btn danger" onclick="act(${inlineArg(t.id)},'cancel')">取消</button>`:''}${['failed','cancelled'].includes(t.status)?`<button class="btn ghost" onclick="act(${inlineArg(t.id)},'retry')">重试</button>`:''}<button class="btn danger" onclick="del(${inlineArg(t.id)})">删除</button></div>${taskFileArea(t)}${t.error_message?`<p class="error">${esc(t.error_code)}：${esc(t.error_message)}</p>`:''}${t.log_tail?`<details><summary>诊断日志</summary><pre>${esc(t.log_tail)}</pre></details>`:''}</div>`).join('')||'<p class="muted">暂无任务</p>';
     }catch(e){console.error(e)}
 }
 async function act(i,a){await api(`/api/tasks/${i}/${a}`,{method:'POST'});loadTasks()}
@@ -70,6 +81,29 @@ async function downloadFile(i,encodedSourceUrl){
     a.download='media';
     a.click();
     URL.revokeObjectURL(objectUrl);
+}
+async function saveToKoofr(i,button){
+    const status=button.closest('.task-file').querySelector('.koofr-status');
+    button.disabled=true;
+    try{
+        const d=await api(`/api/tasks/${encodeURIComponent(i)}/save-to-koofr`,{method:'POST'});
+        status.className='good koofr-status';
+        status.textContent=`已保存到 Koofr\n云盘路径：${d.path||''}`;
+        button.textContent='已保存到 Koofr';
+    }catch(e){
+        status.className='error koofr-status';
+        status.textContent=e.message;
+    }finally{button.disabled=false}
+}
+async function downloadKoofr(i){
+    let r;
+    try{r=await fetch(`/api/tasks/${encodeURIComponent(i)}/koofr-download`,{headers:{Authorization:`Bearer ${token}`}})}catch{return alert('Koofr 下载失败')}
+    if(!r.ok)return alert('Koofr 副本不存在或下载失败');
+    const b=await r.blob(),a=document.createElement('a'),objectUrl=URL.createObjectURL(b);
+    a.href=objectUrl;
+    a.download='koofr-files.zip';
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(objectUrl),0);
 }
 async function loadCookies(){if(!token)return;const a=await api('/api/cookies');$('probeCookie').innerHTML='<option value="">不使用 Cookie</option>'+a.map(x=>`<option value="${x.id}">${esc(x.platform)} · ${esc(x.label)}</option>`).join('');$('cookieList').innerHTML=a.map(x=>`<div class="task row space"><span>${esc(x.label)} · ${esc(x.name)}</span><button class="btn danger" onclick="removeCookie('${x.id}')">删除</button></div>`).join('')}
 $('cookieForm').onsubmit=async e=>{e.preventDefault();const f=$('cookieFile').files[0];if(!f)return alert('请选择 Cookie 文件');const d=new FormData();d.append('file',f);await api(`/api/cookies?platform=${encodeURIComponent($('cookiePlatform').value)}&label=${encodeURIComponent($('cookieLabel').value)}`,{method:'POST',body:d});e.target.reset();loadCookies()};async function removeCookie(i){await api(`/api/cookies/${i}`,{method:'DELETE'});loadCookies()}

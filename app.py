@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, signal, socket, sqlite3, subprocess, threading, time, uuid
+import asyncio, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, signal, socket, sqlite3, subprocess, tempfile, threading, time, uuid, zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from cryptography.fernet import Fernet
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
@@ -190,6 +191,96 @@ def cleanup():
         with con() as c:
             for r in c.execute("SELECT id,finished FROM tasks WHERE status='completed'"):
                 if r['finished'] and datetime.fromisoformat(r['finished'])<cut:shutil.rmtree(DL/r['id'],ignore_errors=True);c.execute("UPDATE tasks SET status='expired',output_path=NULL WHERE id=?",(r['id'],))
+
+class KoofrError(RuntimeError):
+    def __init__(self,message,status_code=409):super().__init__(message);self.status_code=status_code
+
+KOOFR_CATEGORIES={'video':'Videos','audio':'Audio','thumbnail':'Covers','live':'Live','subtitles':'Subtitles'}
+KOOFR_MARKER='.media-download-complete'
+
+def _inside(base:Path,path:Path):
+    try:path.relative_to(base);return True
+    except ValueError:return False
+
+def _koofr_root():
+    raw=os.getenv('KOOFR_ROOT','').strip()
+    if not raw:raise KoofrError('Koofr 未配置，请设置 KOOFR_ROOT',503)
+    root=Path(raw).expanduser().resolve()
+    if not root.exists() or not root.is_dir():raise KoofrError('Koofr 根目录不存在或未挂载',503)
+    if not os.access(root,os.R_OK|os.W_OK|os.X_OK):raise KoofrError('Koofr 根目录不可写',503)
+    return root
+
+def _koofr_target(task):
+    task_id=str(task.get('id') or '')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',task_id):raise KoofrError('任务目录标识无效')
+    mode=str((task.get('options') or {}).get('mode') or 'video')
+    category=KOOFR_CATEGORIES.get(mode,KOOFR_CATEGORIES['video'])
+    root=_koofr_root();target=(root/category/task_id).resolve()
+    if not _inside(root,target):raise KoofrError('Koofr 目标路径非法')
+    return root,target
+
+def _local_output_files(task_id):
+    base=DL.resolve();source=(DL/str(task_id)).resolve()
+    if not _inside(base,source) or not source.is_dir():raise KoofrError('本地任务文件不存在，无法保存到 Koofr',404)
+    files=[]
+    for path in source.rglob('*'):
+        if not path.is_file():continue
+        resolved=path.resolve()
+        if not _inside(source,resolved):raise KoofrError('本地输出包含非法路径')
+        files.append((path.relative_to(source),path))
+    if not files:raise KoofrError('本地任务没有可保存的输出文件',404)
+    return source,files
+
+def _koofr_files(target):
+    if not target.is_dir():return []
+    files=[]
+    for path in target.rglob('*'):
+        if path.name in {KOOFR_MARKER,KOOFR_MARKER+'.tmp'} or not path.is_file():continue
+        resolved=path.resolve()
+        if not _inside(target,resolved):raise KoofrError('Koofr 副本包含非法路径')
+        files.append((path.relative_to(target),path))
+    return sorted(files,key=lambda item:str(item[0]))
+
+def _koofr_payload(task):
+    try:root,target=_koofr_target(task)
+    except KoofrError as exc:return {'saved':False,'path':'','files':[],'size':0,'error':str(exc)}
+    files=_koofr_files(target);size=sum(path.stat().st_size for _,path in files)
+    return {'saved':bool(files) and (target/KOOFR_MARKER).is_file(),'path':str(target) if files else '','files':[str(rel) for rel,_ in files],'size':size}
+
+def save_task_to_koofr(task_id):
+    task=row(task_id)
+    if not task:raise KoofrError('任务不存在',404)
+    if task['status'] not in {'completed','expired'}:raise KoofrError('只有 completed 或 expired 任务可以保存到 Koofr')
+    _,sources=_local_output_files(task_id);root,target=_koofr_target(task)
+    total=sum(path.stat().st_size for _,path in sources)
+    try:
+        target.mkdir(parents=True,exist_ok=True);target=target.resolve()
+        if not _inside(root,target):raise KoofrError('Koofr 目标路径非法')
+        if shutil.disk_usage(root).free<total:raise KoofrError('Koofr 空间不足',507)
+        for relative,source in sources:
+            destination=(target/relative).resolve()
+            if not _inside(target,destination):raise KoofrError('Koofr 目标路径非法')
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            if not destination.exists() or destination.stat().st_size!=source.stat().st_size:shutil.copy2(source,destination)
+        marker_tmp=target/(KOOFR_MARKER+'.tmp')
+        marker_tmp.write_text('complete\n',encoding='utf-8');marker_tmp.replace(target/KOOFR_MARKER)
+    except KoofrError:raise
+    except OSError as exc:raise KoofrError(f'保存到 Koofr 失败：{exc}')
+    return _koofr_payload(task)
+
+def auto_save_subtitles_to_koofr(task_id):
+    try:save_task_to_koofr(task_id)
+    except Exception as exc:
+        task=row(task_id)
+        if task:
+            message=f'字幕下载完成，但保存到 Koofr 失败：{str(exc)}'
+            old=str(task.get('log_tail') or '')
+            if message not in old:patch(task_id,log_tail=(old+'\n[Koofr] '+message)[-12000:])
+
+def _koofr_zip_name(task):
+    name=re.sub(r'[\\/:*?"<>|\r\n]+','_',str(task.get('title') or 'media'))
+    return (name.strip(' ._')[:100] or 'media')+'-koofr.zip'
+
 class Pass(BaseModel):password:str=Field(min_length=1,max_length=256)
 class Probe(BaseModel):url:str=Field(min_length=8,max_length=2048);cookie_id:str|None=None
 class Task(BaseModel):url:str;title:str|None=None;platform:str|None=None;options:dict[str,Any]={}
@@ -248,6 +339,32 @@ def download(i):
     t=row(i);p=Path(t['output_path']).resolve() if t and t.get('output_path') else None
     if not p or DL not in p.parents or not p.is_file():raise HTTPException(404,'文件不存在')
     return FileResponse(p,filename=p.name)
+@app.post('/api/tasks/{i}/save-to-koofr',dependencies=[Depends(auth)])
+def save_koofr(i):
+    try:return save_task_to_koofr(i)
+    except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
+@app.get('/api/tasks/{i}/koofr-status',dependencies=[Depends(auth)])
+def koofr_status(i):
+    t=row(i)
+    if not t:raise HTTPException(404,'任务不存在')
+    return _koofr_payload(t)
+@app.get('/api/tasks/{i}/koofr-download',dependencies=[Depends(auth)])
+def koofr_download(i):
+    task=row(i)
+    if not task:raise HTTPException(404,'任务不存在')
+    try:root,target=_koofr_target(task);files=_koofr_files(target)
+    except KoofrError as exc:raise HTTPException(exc.status_code,str(exc))
+    if not files:raise HTTPException(404,'Koofr 副本不存在')
+    if len(files)==1:return FileResponse(files[0][1],filename=files[0][1].name)
+    fd,archive=tempfile.mkstemp(prefix=f'koofr-{i}-',suffix='.zip',dir=str(TMP));os.close(fd);archive_path=Path(archive)
+    try:
+        with zipfile.ZipFile(archive_path,'w',zipfile.ZIP_DEFLATED) as bundle:
+            for relative,path in files:
+                if not _inside(target,path.resolve()):raise KoofrError('Koofr 副本包含非法路径')
+                bundle.write(path,arcname=str(relative))
+    except Exception:
+        archive_path.unlink(missing_ok=True);raise HTTPException(500,'Koofr 副本打包失败')
+    return FileResponse(archive_path,filename=_koofr_zip_name(task),background=BackgroundTask(archive_path.unlink,missing_ok=True))
 @app.get('/api/settings',dependencies=[Depends(auth)])
 def gs():
     d=settings();p=d.get('proxy_url','');d['proxy_url']=p[:12]+'••••' if p else '';return d
