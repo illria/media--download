@@ -201,6 +201,8 @@ KOOFR_CONTAINER_PATH=Path('/mnt/koofr').resolve()
 KOOFR_REMOTE_FS={'fuse.rclone'}
 KOOFR_ROOT_CACHE_TTL=8
 KOOFR_ROOT_CACHE={'key':None,'expires':0.0,'root':None,'error':None,'status_code':503}
+KOOFR_HEALTH_CACHE_TTL=8
+KOOFR_HEALTH_CACHE={'key':None,'expires':0.0,'value':None}
 
 def _inside(base:Path,path:Path):
     try:path.relative_to(base);return True
@@ -256,12 +258,28 @@ def _koofr_root(force=False):
     with LOCK:KOOFR_ROOT_CACHE.update(key=key,expires=time.monotonic()+KOOFR_ROOT_CACHE_TTL,root=root,error=None,status_code=503)
     return root
 
-def _koofr_health():
+def _koofr_write_probe(root):
+    probe=root/f'.media-download-health-{secrets.token_hex(8)}.tmp'
     try:
-        root=_koofr_root();usage=shutil.disk_usage(root)
-        return {'mounted':True,'writable':True,'root':str(root),'total':usage.total,'free':usage.free,'error':''}
+        with probe.open('xb') as handle:
+            handle.write(b'ok');handle.flush();os.fsync(handle.fileno())
+    except OSError as exc:raise KoofrError(f'Koofr 实际写入测试失败：{exc}',503)
+    finally:
+        try:probe.unlink(missing_ok=True)
+        except OSError:pass
+
+def _koofr_health():
+    key=(os.getenv('KOOFR_ROOT','').strip(),os.getenv('KOOFR_HOST_PATH','').strip())
+    current=time.monotonic()
+    with LOCK:
+        if KOOFR_HEALTH_CACHE['key']==key and KOOFR_HEALTH_CACHE['expires']>current and KOOFR_HEALTH_CACHE['value'] is not None:return dict(KOOFR_HEALTH_CACHE['value'])
+    try:
+        root=_koofr_root();_koofr_write_probe(root);usage=shutil.disk_usage(root)
+        value={'mounted':True,'writable':True,'root':str(root),'total':usage.total,'free':usage.free,'error':''}
     except (KoofrError,OSError) as exc:
-        return {'mounted':False,'writable':False,'root':'','total':0,'free':0,'error':str(exc)}
+        value={'mounted':False,'writable':False,'root':'','total':0,'free':0,'error':str(exc)}
+    with LOCK:KOOFR_HEALTH_CACHE.update(key=key,expires=time.monotonic()+KOOFR_HEALTH_CACHE_TTL,value=value)
+    return dict(value)
 
 def _koofr_target(task,force_mount_check=False):
     task_id=str(task.get('id') or '')
@@ -295,10 +313,13 @@ def _koofr_files(target):
     return sorted(files,key=lambda item:str(item[0]))
 
 def _koofr_payload(task):
-    try:root,target=_koofr_target(task)
-    except KoofrError as exc:return {'saved':False,'path':'','files':[],'size':0,'error':str(exc)}
-    files=_koofr_files(target);size=sum(path.stat().st_size for _,path in files)
-    return {'saved':bool(files) and (target/KOOFR_MARKER).is_file(),'path':str(target) if files else '','files':[str(rel) for rel,_ in files],'size':size}
+    try:
+        root,target=_koofr_target(task)
+        files=_koofr_files(target)
+        size=sum(path.stat().st_size for _,path in files)
+        return {'saved':bool(files) and (target/KOOFR_MARKER).is_file(),'path':str(target) if files else '','files':[str(rel) for rel,_ in files],'size':size}
+    except (KoofrError,OSError) as exc:
+        return {'saved':False,'path':'','files':[],'size':0,'error':str(exc)}
 
 def save_task_to_koofr(task_id,allow_processing_subtitles=False):
     task=row(task_id)
