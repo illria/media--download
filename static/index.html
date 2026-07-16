@@ -10,7 +10,7 @@
 <section id="page-cookies" class="section"><div class="card"><h2>Cookie 管理</h2><p class="muted">YouTube 数据中心 IP 被限制时，请上传浏览器导出的 Netscape cookies.txt。</p><form id="cookieForm"><div class="settings"><label>平台<input id="cookiePlatform" value="youtube"></label><label>备注<input id="cookieLabel" placeholder="我的 YouTube Cookie"></label></div><input id="cookieFile" type="file" accept=".txt" style="margin-top:12px"><br><button class="btn blue" style="margin-top:12px">上传</button></form><div id="cookieList"></div></div></section>
 <section id="page-settings" class="section"><div class="card"><h2>系统设置</h2><div class="settings"><label>最大文件 GB<input id="maxFile" type="number"></label><label>最高分辨率<input id="maxRes" type="number"></label><label>保留小时<input id="retention" type="number"></label><label>最低剩余空间 GB<input id="minFree" type="number"></label><label>请求间隔秒<input id="sleep" type="number"></label><label>代理<input id="proxy" placeholder="socks5h://user:pass@host:port"></label></div><button id="saveSettings" class="btn blue" style="margin-top:16px">保存</button><span id="settingsMsg" class="good"></span></div></section>
 </main></div></div><script>
-const $=x=>document.getElementById(x);let token=localStorage.mediaToken||'',setup=false,probe=null,timer=null;const koofrStatusCache=new Map();
+const $=x=>document.getElementById(x);let token=localStorage.mediaToken||'',setup=false,probe=null,timer=null;const koofrStatusCache=new Map(),taskStatusCache=new Map(),koofrStatusInFlight=new Set();
 async function api(p,o={}){o.headers={...(o.headers||{}),...(token?{Authorization:`Bearer ${token}`}:{})};if(o.body&&!(o.body instanceof FormData)){o.headers['Content-Type']='application/json';o.body=JSON.stringify(o.body)}const r=await fetch(p,o);let d;try{d=await r.json()}catch{d={detail:await r.text()}}if(!r.ok){if(r.status===401){token='';localStorage.removeItem('mediaToken');$('auth').classList.remove('hidden')}throw new Error(typeof d.detail==='string'?d.detail:(d.detail?.message||JSON.stringify(d.detail)))}return d}
 function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function fmt(n){if(!n)return'';for(const u of ['B','KB','MB','GB']){if(n<1024)return n.toFixed(1)+' '+u;n/=1024}return n.toFixed(1)+' TB'}
 async function init(){const s=await api('/api/auth/status');setup=s.setup_required;$('authTitle').textContent=setup?'首次初始化':'管理员登录';$('authText').textContent=setup?'设置至少 8 位管理员密码':'输入管理员密码';if(token){$('auth').classList.add('hidden');boot()}}
@@ -56,12 +56,20 @@ async function loadTasks(render=true){
     try{
         const a=await api(render?'/api/tasks?include_koofr=1':'/api/tasks');
         if(!render&&!document.querySelector('[data-page="tasks"]').classList.contains('active'))return;
+        const statusRefreshes=[];
         const tasks=a.map(t=>{
             const id=String(t.id||'');
+            const previous=taskStatusCache.get(id);
             if(t.koofr)koofrStatusCache.set(id,t.koofr);
-            else if(koofrStatusCache.has(id))t.koofr=koofrStatusCache.get(id);
+            if(t.status==='completed'&&['processing','downloading'].includes(previous)&&!koofrStatusInFlight.has(id)){
+                koofrStatusInFlight.add(id);
+                statusRefreshes.push(api(`/api/tasks/${encodeURIComponent(id)}/koofr-status`).then(status=>koofrStatusCache.set(id,status)).catch(()=>koofrStatusCache.set(id,{saved:false,path:'',files:[],size:0})).finally(()=>koofrStatusInFlight.delete(id)));
+            }
+            taskStatusCache.set(id,t.status);
+            if(!t.koofr&&koofrStatusCache.has(id))t.koofr=koofrStatusCache.get(id);
             return t;
         });
+        if(statusRefreshes.length){await Promise.all(statusRefreshes);tasks.forEach(t=>{if(!t.koofr&&koofrStatusCache.has(String(t.id||'')))t.koofr=koofrStatusCache.get(String(t.id||''))})}
         $('taskList').innerHTML=tasks.map(t=>`<div class="task"><div class="row space"><strong>${esc(t.title||t.url)}</strong><span>${esc(t.status)}</span></div><div class="progress"><span style="width:${Math.max(0,Math.min(100,t.progress||0))}%"></span></div><div class="row"><span>${Number(t.progress||0).toFixed(1)}%</span><span class="muted">${esc(t.speed||'')}</span>${['queued','downloading'].includes(t.status)?`<button class="btn danger" onclick="act(${inlineArg(t.id)},'cancel')">取消</button>`:''}${['failed','cancelled'].includes(t.status)?`<button class="btn ghost" onclick="act(${inlineArg(t.id)},'retry')">重试</button>`:''}<button class="btn danger" onclick="del(${inlineArg(t.id)})">删除</button></div>${taskFileArea(t)}${t.error_message?`<p class="error">${esc(t.error_code)}：${esc(t.error_message)}</p>`:''}${t.log_tail?`<details><summary>诊断日志</summary><pre>${esc(t.log_tail)}</pre></details>`:''}</div>`).join('')||'<p class="muted">暂无任务</p>';
     }catch(e){console.error(e)}
 }
