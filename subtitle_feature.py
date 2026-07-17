@@ -1254,6 +1254,8 @@ def install(core: Any) -> None:
         models_used: list[str] = []
         translated_flag = False
         translation_quality = None
+        translation_attempted = False
+        translation_quality_checked = False
         platform_target_direct_used = False
         need_translation = mode in {"translated", "bilingual"} and not same_language and not direct_target and not platform_auto_target
         if need_translation and core.is_guest_task(task):
@@ -1266,6 +1268,7 @@ def install(core: Any) -> None:
         if need_translation:
             settings = load_translation_settings()
             translation_slot = False
+            translation_attempted = True
             try:
                 if not key or not settings["translation_enabled"]:
                     warning = {"code": "SUBTITLE_TRANSLATION_FAILED", "message": "翻译失败，已保留原字幕"}
@@ -1281,6 +1284,8 @@ def install(core: Any) -> None:
                             translated_cues, models_used, translated_flag, translation_quality = translate_cues(
                                 task, cues, source_language, target, key, source_type=source_type
                             )
+                            # Successful return means assert_translation_quality() completed.
+                            translation_quality_checked = True
                             translated_path = work / f"{title}.translated.{target}.srt"
                             write_srt(translated_path, [
                                 {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
@@ -1296,6 +1301,8 @@ def install(core: Any) -> None:
                         translated_cues, models_used, translated_flag, translation_quality = translate_cues(
                             task, cues, source_language, target, key, source_type=source_type
                         )
+                        # Successful return means assert_translation_quality() completed.
+                        translation_quality_checked = True
                         translated_path = work / f"{title}.translated.{target}.srt"
                         write_srt(translated_path, [
                             {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
@@ -1333,7 +1340,13 @@ def install(core: Any) -> None:
                 primary = original
                 translated_flag = False
                 models_used = []
-                translation_quality = {"passed": False, "metrics": {}}
+                # Only quality/structure gate failures mean assert_translation_quality ran.
+                if code in {"SUBTITLE_TRANSLATION_QUALITY_FAILED", "SUBTITLE_TRANSLATION_STRUCTURE_FAILED"}:
+                    translation_quality_checked = True
+                    translation_quality = {"passed": False, "metrics": {}}
+                else:
+                    translation_quality_checked = False
+                    translation_quality = None
             finally:
                 if translation_slot:
                     core.release_guest_translation_slot(task["id"])
@@ -1380,8 +1393,9 @@ def install(core: Any) -> None:
             "requested_source_language": opts["subtitle_source_language"],
             "detected_source_language": source_language or "und",
             "source_quality_passed": bool(source_quality and source_quality.get("passed")),
-            "translation_quality_checked": translation_quality is not None,
-            "translation_quality_passed": bool(translation_quality and translation_quality.get("passed")) if translation_quality is not None else False,
+            "translation_attempted": bool(translation_attempted),
+            "translation_quality_checked": bool(translation_quality_checked),
+            "translation_quality_passed": bool(translation_quality and translation_quality.get("passed")) if translation_quality_checked else False,
             "source_quality_metrics": (source_quality or {}).get("metrics") or {},
             "translation_quality_metrics": (translation_quality or {}).get("metrics") or {},
             "timing_estimated": source_type == "sensevoice",
@@ -1427,15 +1441,62 @@ def install(core: Any) -> None:
                 ranked = sorted(platform_files, key=lambda item: score_subtitle(item, source, target, prefer_target=False, media_language=media_language))
                 original_hit = next((item for item in ranked if item.get("original")), None)
                 if mode == "translated":
-                    manual_target = next((item for item in platform_files if normalize_lang(item.get("language")) == target and not item.get("auto")), None)
+                    # Priority (any reliable manual/original beats platform auto-translated target):
+                    # 1 target manual, 2 original manual, 3 original auto,
+                    # 4 explicit manual, 5 explicit original auto, 6 other manual,
+                    # 7 target platform auto-translated, 8 ASR (later).
+                    manual_target = next((
+                        item for item in platform_files
+                        if normalize_lang(item.get("language")) == target and not item.get("auto")
+                    ), None)
                     if manual_target:
                         source_meta = manual_target
                         source_type = "platform_target_manual"
-                    elif original_hit:
-                        source_meta = original_hit
-                        source_type = "platform_auto_original" if original_hit.get("auto") else "platform_manual_original"
-                    else:
-                        # No original track: allow target auto-translated as last resort only.
+                    if source_meta is None:
+                        original_manual = next((
+                            item for item in platform_files
+                            if item.get("original") and not item.get("auto")
+                        ), None)
+                        if original_manual:
+                            source_meta = original_manual
+                            source_type = "platform_manual_original"
+                    if source_meta is None:
+                        original_auto = next((
+                            item for item in platform_files
+                            if item.get("original") and item.get("auto")
+                        ), None)
+                        if original_auto:
+                            source_meta = original_auto
+                            source_type = "platform_auto_original"
+                    if source_meta is None and source != "auto":
+                        explicit_manual = next((
+                            item for item in platform_files
+                            if normalize_lang(item.get("language")) == normalize_lang(source) and not item.get("auto")
+                        ), None)
+                        if explicit_manual:
+                            source_meta = explicit_manual
+                            source_type = "platform_manual"
+                    if source_meta is None and source != "auto":
+                        explicit_original_auto = next((
+                            item for item in platform_files
+                            if (
+                                normalize_lang(item.get("language")) == normalize_lang(source)
+                                and item.get("auto")
+                                and item.get("original")
+                            )
+                        ), None)
+                        if explicit_original_auto:
+                            source_meta = explicit_original_auto
+                            source_type = "platform_auto_original"
+                    if source_meta is None:
+                        manual_sources = [item for item in platform_files if not item.get("auto")]
+                        source_meta = choose_source_subtitle(
+                            manual_sources, source, target, prefer_target=False, media_language=media_language
+                        )
+                        if source_meta:
+                            source_type = "platform_manual"
+                    if source_meta is None:
+                        # Last platform resort only: target-language auto-translated track.
                         target_auto = next((
                             item for item in platform_files
                             if normalize_lang(item.get("language")) == target and item.get("auto")
@@ -1443,23 +1504,6 @@ def install(core: Any) -> None:
                         if target_auto:
                             source_meta = target_auto
                             source_type = "platform_auto_translated_target"
-                        else:
-                            # Avoid double-translation of random platform auto-translated tracks in auto mode.
-                            usable = [
-                                item for item in platform_files
-                                if (
-                                    (not item.get("auto"))
-                                    or item.get("manual")
-                                    or item.get("original")
-                                    or (
-                                        source != "auto"
-                                        and normalize_lang(item.get("language")) == normalize_lang(source)
-                                    )
-                                )
-                            ]
-                            source_meta = choose_source_subtitle(usable or [], source, target, prefer_target=False, media_language=media_language)
-                            if source_meta:
-                                source_type = "platform_auto" if source_meta.get("auto") else "platform_manual"
                 else:
                     source_meta = original_hit or choose_source_subtitle(platform_files, source, target, prefer_target=False, media_language=media_language)
                     if source_meta:
