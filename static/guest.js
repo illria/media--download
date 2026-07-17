@@ -14,6 +14,7 @@
       'zh-CN': '简体中文', 'zh-TW': '繁体中文', en: '英语', ja: '日语', ko: '韩语',
       vi: '越南语', th: '泰语', fr: '法语', de: '德语', es: '西班牙语',
       pt: '葡萄牙语', ru: '俄语', ar: '阿拉伯语', id: '印度尼西亚语', tr: '土耳其语', it: '意大利语',
+      bn: '孟加拉语',
     },
   };
   const ERROR_MAP = {
@@ -44,6 +45,11 @@
     GUEST_TRANSLATION_HOURLY_LIMIT: '游客字幕翻译已达到每小时次数上限。',
     GUEST_TRANSLATION_BUSY: '字幕翻译正在处理中，请稍后重试。',
     GUEST_TRANSLATION_DURATION_LIMIT: '该视频超过游客字幕翻译时长限制。',
+    ASR_QUALITY_FAILED: '语音识别结果质量过低，未生成字幕。',
+    SUBTITLE_SOURCE_QUALITY_FAILED: '平台字幕质量异常，未继续翻译。',
+    SUBTITLE_TRANSLATION_QUALITY_FAILED: '翻译质量未达标，已保留原字幕。',
+    SUBTITLE_TRANSLATION_STRUCTURE_FAILED: '翻译结果结构异常，已保留原字幕。',
+    SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN: '无法可靠识别源语言，未继续翻译。',
     SUBTITLE_TRANSLATION_FAILED: '翻译失败，已保留原字幕。',
   };
   const OUTPUT_LABEL = { original: '仅原字幕', translated: '翻译字幕', bilingual: '双语字幕' };

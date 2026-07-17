@@ -23,7 +23,7 @@ SECRET=os.getenv('SECRET_KEY') or secret(DB.parent/'secret.key',lambda:secrets.t
 GUEST_DEFAULT={'max_file_size_gb':1,'default_resolution':720,'max_resolution':1080,'retention_minutes':30,'min_free_gb':2,'emergency_free_gb':1,'request_sleep_seconds':5,'max_active_tasks_per_guest':1,'max_queued_tasks_per_guest':2,'global_guest_concurrency':1,'max_video_duration_minutes':60,'allow_ai_transcription':True,'ai_transcription_max_duration_minutes':20,'ai_transcription_global_concurrency':1,'ai_transcription_hourly_limit_per_guest':3,'allow_subtitle_translation':True,'subtitle_translation_max_duration_minutes':60,'subtitle_translation_hourly_limit_per_guest':3,'subtitle_translation_global_concurrency':1,'subtitle_translation_max_target_languages':1,'allow_cookie':False,'allow_koofr':False,'allow_live_download':False}
 DEFAULT={'max_file_size_gb':5,'retention_hours':24,'min_free_gb':5,'max_resolution':1080,'proxy_url':'','youtube_compatibility_mode':True,'request_sleep_seconds':1,'guest_policy':GUEST_DEFAULT}
 GUEST_SESSION_COOKIE='media_guest_session'; GUEST_SESSION_MAX_AGE=60*60*24*30; GUEST_PROBE_TTL=10*60; GUEST_AI_EVENT='guest_ai_transcription'; GUEST_TRANSLATION_EVENT='guest_subtitle_translation'
-SUBTITLE_LANGUAGES={'zh-CN':'简体中文','zh-TW':'繁体中文','en':'英语','ja':'日语','ko':'韩语','vi':'越南语','th':'泰语','fr':'法语','de':'德语','es':'西班牙语','pt':'葡萄牙语','ru':'俄语','ar':'阿拉伯语','id':'印度尼西亚语','tr':'土耳其语','it':'意大利语'}
+SUBTITLE_LANGUAGES={'zh-CN':'简体中文','zh-TW':'繁体中文','en':'英语','ja':'日语','ko':'韩语','vi':'越南语','th':'泰语','fr':'法语','de':'德语','es':'西班牙语','pt':'葡萄牙语','ru':'俄语','ar':'阿拉伯语','id':'印度尼西亚语','tr':'土耳其语','it':'意大利语','bn':'孟加拉语'}
 SUBTITLE_SOURCE_LANGUAGES={'auto':'自动选择',**SUBTITLE_LANGUAGES}
 SUBTITLE_OUTPUT_MODES={'original':'仅原字幕','translated':'翻译字幕','bilingual':'双语字幕'}
 ACTIVE={}; GUEST_PROBES={}; GUEST_AI_ACTIVE=set(); SUBTITLE_TRANSLATION_ACTIVE=set(); LOCK=threading.RLock(); STOP=threading.Event()
@@ -131,7 +131,7 @@ def guest_policy():return normalize_guest_policy(settings().get('guest_policy'))
 def normalize_subtitle_language(value,allow_auto=False,default='zh-CN',required=False,field_name='language'):
     aliases={
         'zh':'zh-CN','zh-hans':'zh-CN','zh-hant':'zh-TW','cn':'zh-CN','jp':'ja','kr':'ko',
-        'zh-cn':'zh-CN','zh-tw':'zh-TW',
+        'zh-cn':'zh-CN','zh-tw':'zh-TW','bn-bd':'bn','bn-in':'bn','bangla':'bn','bengali':'bn',
     }
     if value is None or (isinstance(value,str) and value.strip()==''):
         if required:raise ValueError(field_name)
