@@ -51,7 +51,7 @@ def execute(core: Any, original_error: Any, task_id: str) -> None:
     task['url']=yr.canonical_url(core,task['url']); cookie=None; logs=[]
     try:
         config=core.task_policy(task)
-        if shutil.disk_usage(core.ROOT).free < int(config['min_free_gb'])*1024**3:
+        if shutil.disk_usage(core.ROOT).free < core.gb_bytes(config['min_free_gb']):
             if core.is_guest_task(task): raise RuntimeError(json.dumps({'code':'guest_disk_space_low','message':'游客任务暂不可用：服务器剩余空间不足'},ensure_ascii=False))
             raise RuntimeError('no space')
         cookie=core.cpath(task['options'].get('cookie_id')) if not core.is_guest_task(task) else None; work=core.TMP/task_id; work.mkdir(parents=True,exist_ok=True)
@@ -70,7 +70,7 @@ def execute(core: Any, original_error: Any, task_id: str) -> None:
                 if m: core.patch(task_id,status='downloading',progress=min(float(m.group(1)),98.0),speed=m.group(2),eta=m.group(3),log_tail='\n'.join(logs))
                 if any(x in s for x in ('[Merger]','[VideoRemuxer]','[VideoConvertor]','[ExtractAudio]','[Metadata]','[ThumbnailsConvertor]')): core.patch(task_id,status='processing',progress=99,speed='',eta='正在合并/处理',log_tail='\n'.join(logs))
                 if core.guest_task_size_exceeded(task,work):
-                    os.killpg(process.pid,signal.SIGTERM);process.wait(timeout=10);raise core.guest_limit_failure()
+                    os.killpg(process.pid,signal.SIGTERM);process.wait(timeout=10);raise core.guest_limit_failure(task)
                 current=core.row(task_id)
                 if current and current['status']=='cancelled': os.killpg(process.pid,signal.SIGTERM); break
             rc=process.wait(); current=core.row(task_id)
@@ -83,8 +83,8 @@ def execute(core: Any, original_error: Any, task_id: str) -> None:
         path,size=core.move(task_id)
         if (core.row(task_id) or {}).get('status')=='cancelled':
             shutil.rmtree(core.DL/task_id,ignore_errors=True);return
-        if core.is_guest_task(task) and size>int(config['max_file_size_gb']*1024**3):
-            shutil.rmtree(core.DL/task_id,ignore_errors=True);raise core.guest_limit_failure()
+        if core.is_guest_task(task) and size>core.gb_bytes(config['max_file_size_gb']):
+            shutil.rmtree(core.DL/task_id,ignore_errors=True);raise core.guest_limit_failure(task)
         core.patch(task_id,status='completed',progress=100,speed='',eta='',output_path=path,output_size=size,finished=core.now(),log_tail='\n'.join(logs))
     except Exception as exc:
         try: parsed=json.loads(str(exc)); code,message=parsed['code'],parsed['message']

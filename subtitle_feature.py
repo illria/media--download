@@ -52,13 +52,13 @@ def install(core: Any) -> None:
         if "audio_too_long" in lower:
             return "AUDIO_TOO_LONG", "AI 字幕目前只处理不超过 1 小时的音频。"
         if "guest_ai_duration_limit" in lower:
-            return "GUEST_AI_DURATION_LIMIT", "游客 AI 字幕最长支持 20 分钟。"
+            return "GUEST_AI_DURATION_LIMIT", "游客 AI 字幕超过允许时长。"
         if "guest_ai_busy" in lower:
             return "GUEST_AI_BUSY", "游客 AI 字幕正在处理中，请稍后重试。"
         if "guest_ai_hourly_limit" in lower:
-            return "GUEST_AI_HOURLY_LIMIT", "游客 AI 字幕每小时最多 3 次。"
+            return "GUEST_AI_HOURLY_LIMIT", "游客 AI 字幕已达到每小时次数上限。"
         if "guest_ai_disabled" in lower:
-            return "GUEST_AI_DISABLED", "当前游客策略未启用 AI 字幕。"
+            return "GUEST_AI_DISABLED", "当前未启用游客 AI 字幕。"
         if "transcription_empty" in lower:
             return "TRANSCRIPTION_EMPTY", "语音识别没有返回有效文字。"
         return original_error(text, url)
@@ -95,7 +95,7 @@ def install(core: Any) -> None:
                     process.wait(timeout=10)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
-                raise core.guest_limit_failure()
+                raise core.guest_limit_failure(task)
             if time.monotonic() >= deadline:
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
@@ -166,9 +166,16 @@ def install(core: Any) -> None:
         return float(result.stdout.strip())
 
     def make_chunks(task: dict[str, Any], source: Path, work: Path, total: float) -> list[Path]:
-        maximum = core.task_policy(task)['ai_transcription_max_duration_minutes'] * 60 if core.is_guest_task(task) else 3600.5
-        if total > maximum:
-            raise RuntimeError("GUEST_AI_DURATION_LIMIT" if core.is_guest_task(task) else "AUDIO_TOO_LONG")
+        if core.is_guest_task(task):
+            policy = core.task_policy(task)
+            maximum = policy["ai_transcription_max_duration_minutes"] * 60
+            if total > maximum:
+                raise RuntimeError(json.dumps({
+                    "code": "GUEST_AI_DURATION_LIMIT",
+                    "message": f"游客 AI 字幕最长支持 {int(policy['ai_transcription_max_duration_minutes'])} 分钟。",
+                }, ensure_ascii=False))
+        elif total > 3600.5:
+            raise RuntimeError("AUDIO_TOO_LONG")
         chunk_dir = work / "chunks"
         chunk_dir.mkdir(exist_ok=True)
         result = run_task(task, work, [
@@ -271,7 +278,7 @@ def install(core: Any) -> None:
         shutil.rmtree(core.TMP / task["id"], ignore_errors=True)
         if core.is_guest_task(task) and core.guest_task_size_exceeded(task, destination):
             shutil.rmtree(destination, ignore_errors=True)
-            raise core.guest_limit_failure()
+            raise core.guest_limit_failure(task)
         core.patch(task["id"], progress=100, eta="", output_path=str(primary_target), output_size=total_size)
         auto_save = getattr(core, "auto_save_subtitles_to_koofr", None)
         if auto_save and not core.is_guest_task(task):

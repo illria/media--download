@@ -91,6 +91,15 @@ def _guest_bool(value,default):
     if isinstance(value,str) and value.lower() in {'true','1','yes'}:return True
     if isinstance(value,str) and value.lower() in {'false','0','no'}:return False
     return default
+def gb_bytes(value):
+    try:return int(float(value)*1024**3)
+    except (TypeError,ValueError):return 0
+def format_gb(value):
+    try:number=float(value)
+    except (TypeError,ValueError):return str(value)
+    if number==int(number):return str(int(number))
+    text=f'{number:.3f}'.rstrip('0').rstrip('.')
+    return text or '0'
 def normalize_guest_policy(raw=None):
     incoming=raw if isinstance(raw,dict) else {}; policy=dict(GUEST_DEFAULT)
     for key in policy:
@@ -290,8 +299,15 @@ def task_directory_size(path):
     try:return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
     except OSError:return 0
 def guest_task_size_exceeded(task,path):
-    return is_guest_task(task) and task_directory_size(path)>int(task_policy(task)['max_file_size_gb']*1024**3)
-def guest_limit_failure():return RuntimeError(json.dumps({'code':'guest_file_limit_exceeded','message':'游客单任务文件最大为 1 GB'},ensure_ascii=False))
+    return is_guest_task(task) and task_directory_size(path)>gb_bytes(task_policy(task)['max_file_size_gb'])
+def guest_limit_failure(task_or_policy=None):
+    if isinstance(task_or_policy,dict) and task_or_policy.get('owner_type')=='guest':
+        policy=task_policy(task_or_policy)
+    elif isinstance(task_or_policy,dict):
+        policy=normalize_guest_policy(task_or_policy)
+    else:
+        policy=guest_policy()
+    return RuntimeError(json.dumps({'code':'guest_file_limit_exceeded','message':f'游客单任务文件最大为 {format_gb(policy["max_file_size_gb"])} GB'},ensure_ascii=False))
 def guest_active_count(owner_id=None):
     query="SELECT COUNT(*) AS n FROM tasks WHERE owner_type='guest' AND status IN ('downloading','processing')";args=[]
     if owner_id is not None:query+=' AND owner_id=?';args.append(owner_id)
@@ -308,13 +324,15 @@ def guest_ai_hourly_count(owner_id,connection=None):
 def consume_guest_ai_quota(task):
     if not is_guest_task(task):return
     policy=task_policy(task)
-    if not policy['allow_ai_transcription']:raise RuntimeError('GUEST_AI_DISABLED')
+    if not policy['allow_ai_transcription']:
+        raise RuntimeError(json.dumps({'code':'GUEST_AI_DISABLED','message':'当前未启用游客 AI 字幕。'},ensure_ascii=False))
     owner_id=str(task.get('owner_id') or '')
     c=con(); c.isolation_level=None
     try:
         c.execute('BEGIN IMMEDIATE')
         used=guest_ai_hourly_count(owner_id,c)
-        if used>=policy['ai_transcription_hourly_limit_per_guest']:raise RuntimeError('GUEST_AI_HOURLY_LIMIT')
+        if used>=policy['ai_transcription_hourly_limit_per_guest']:
+            raise RuntimeError(json.dumps({'code':'GUEST_AI_HOURLY_LIMIT','message':f'游客 AI 字幕每小时最多 {int(policy["ai_transcription_hourly_limit_per_guest"])} 次。'},ensure_ascii=False))
         c.execute('INSERT INTO guest_rate_events(id,owner_id,event_type,task_id,created) VALUES(?,?,?,?,?)',(uuid.uuid4().hex,owner_id,GUEST_AI_EVENT,task.get('id'),now()))
         c.execute('COMMIT')
     except Exception:
@@ -325,9 +343,11 @@ def consume_guest_ai_quota(task):
 def acquire_guest_ai_slot(task):
     if not is_guest_task(task):return False
     policy=task_policy(task)
-    if not policy['allow_ai_transcription']:raise RuntimeError('GUEST_AI_DISABLED')
+    if not policy['allow_ai_transcription']:
+        raise RuntimeError(json.dumps({'code':'GUEST_AI_DISABLED','message':'当前未启用游客 AI 字幕。'},ensure_ascii=False))
     with LOCK:
-        if len(GUEST_AI_ACTIVE)>=policy['ai_transcription_global_concurrency']:raise RuntimeError('GUEST_AI_BUSY')
+        if len(GUEST_AI_ACTIVE)>=policy['ai_transcription_global_concurrency']:
+            raise RuntimeError(json.dumps({'code':'GUEST_AI_BUSY','message':'游客 AI 字幕正在处理中，请稍后重试。'},ensure_ascii=False))
         GUEST_AI_ACTIVE.add(task['id'])
     return True
 def start_guest_ai(task):
@@ -374,7 +394,7 @@ def execute(i):
     if not t or t.get('status')=='cancelled':return
     try:
         policy=task_policy(t);free=shutil.disk_usage(ROOT).free
-        if free<int(policy['min_free_gb'])*1024**3:
+        if free<gb_bytes(policy['min_free_gb']):
             if is_guest_task(t):raise RuntimeError(json.dumps({'code':'guest_disk_space_low','message':'游客任务暂不可用：服务器剩余空间不足'},ensure_ascii=False))
             raise RuntimeError('no space')
         cp=cpath(t['options'].get('cookie_id')) if not is_guest_task(t) else None;(TMP/i).mkdir(parents=True,exist_ok=True);patch(i,status='downloading',progress=0,error_code=None,error_message=None,log_tail='')
@@ -387,7 +407,7 @@ def execute(i):
                 s=line.strip();logs=(logs+[s])[-120:] if s else logs;m=re.search(r'PROGRESS:\s*([0-9.]+)%\|([^|]*)\|([^|]*)',s)
                 if m:patch(i,progress=float(m.group(1)),speed=m.group(2),eta=m.group(3),log_tail='\n'.join(logs))
                 if guest_task_size_exceeded(t,TMP/i):
-                    os.killpg(p.pid,signal.SIGTERM);p.wait(timeout=10);raise guest_limit_failure()
+                    os.killpg(p.pid,signal.SIGTERM);p.wait(timeout=10);raise guest_limit_failure(t)
                 if row(i)['status']=='cancelled':os.killpg(p.pid,signal.SIGTERM);break
             rc=p.wait()
             if row(i)['status']=='cancelled':shutil.rmtree(TMP/i,ignore_errors=True);return
@@ -395,7 +415,7 @@ def execute(i):
         if rc:code,msg=err('\n'.join(logs),t['url']);raise RuntimeError(json.dumps({'code':code,'message':msg},ensure_ascii=False))
         path,size=move(i)
         if (row(i) or {}).get('status')=='cancelled':shutil.rmtree(DL/i,ignore_errors=True);return
-        if is_guest_task(t) and size>int(policy['max_file_size_gb']*1024**3):shutil.rmtree(DL/i,ignore_errors=True);raise guest_limit_failure()
+        if is_guest_task(t) and size>gb_bytes(policy['max_file_size_gb']):shutil.rmtree(DL/i,ignore_errors=True);raise guest_limit_failure(t)
         patch(i,status='completed',progress=100,output_path=path,output_size=size,finished=now(),log_tail='\n'.join(logs))
     except Exception as e:
         try:x=json.loads(str(e));code,msg=x['code'],x['message']
@@ -454,8 +474,8 @@ def next_queued_task():
         task=row(task_id)
         if not task:continue
         policy=task_policy(task);free=shutil.disk_usage(ROOT).free
-        if free<int(policy['emergency_free_gb'])*1024**3:guest_emergency_cleanup();return None
-        if free<int(policy['min_free_gb'])*1024**3:return None
+        if free<gb_bytes(policy['emergency_free_gb']):guest_emergency_cleanup();return None
+        if free<gb_bytes(policy['min_free_gb']):return None
         if guest_active_count()>=policy['global_guest_concurrency'] or guest_active_count(task['owner_id'])>=policy['max_active_tasks_per_guest']:continue
         return task_id
     return None
@@ -668,13 +688,14 @@ def insert_task(url,title,platform,options,owner_type='admin',owner_id='admin',p
     return row(task_id)
 def insert_guest_task_atomic(url,title,platform,options,identity,policy):
     free=shutil.disk_usage(ROOT).free
-    if free<int(policy['emergency_free_gb'])*1024**3:guest_emergency_cleanup();free=shutil.disk_usage(ROOT).free
-    if free<int(policy['min_free_gb'])*1024**3:guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
+    if free<gb_bytes(policy['emergency_free_gb']):guest_emergency_cleanup();free=shutil.disk_usage(ROOT).free
+    if free<gb_bytes(policy['min_free_gb']):guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
     task_id=uuid.uuid4().hex;created=now();owner_id=identity['owner_id']
     c=con(); c.isolation_level=None
     try:
         c.execute('BEGIN IMMEDIATE')
-        if guest_queue_count(owner_id,c)>=policy['max_queued_tasks_per_guest']:raise HTTPException(429,detail={'code':'guest_queue_limit_exceeded','message':'游客最多保留 2 个排队任务'})
+        if guest_queue_count(owner_id,c)>=policy['max_queued_tasks_per_guest']:
+            raise HTTPException(429,detail={'code':'guest_queue_limit_exceeded','message':f'游客最多保留 {int(policy["max_queued_tasks_per_guest"])} 个排队任务'})
         c.execute('INSERT INTO tasks(id,url,title,platform,status,options,created,updated,owner_type,owner_id,policy_snapshot) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(task_id,url,title,platform,'queued',json.dumps(options),created,created,'guest',owner_id,json.dumps(policy)))
         c.execute('COMMIT')
     except Exception:
@@ -685,14 +706,15 @@ def insert_guest_task_atomic(url,title,platform,options,identity,policy):
     return row(task_id)
 def retry_guest_task_atomic(task_id,identity,policy):
     free=shutil.disk_usage(ROOT).free
-    if free<int(policy['min_free_gb'])*1024**3:guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
+    if free<gb_bytes(policy['min_free_gb']):guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
     stamp=now()
     c=con(); c.isolation_level=None
     try:
         c.execute('BEGIN IMMEDIATE')
         current=c.execute("SELECT id,status,owner_type,owner_id FROM tasks WHERE id=?",(task_id,)).fetchone()
         if not current or current['owner_type']!='guest' or not hmac.compare_digest(str(current['owner_id'] or ''),str(identity['owner_id'])):raise HTTPException(404,'任务不存在')
-        if current['status']!='queued' and guest_queue_count(identity['owner_id'],c)>=policy['max_queued_tasks_per_guest']:raise HTTPException(429,detail={'code':'guest_queue_limit_exceeded','message':'游客最多保留 2 个排队任务'})
+        if current['status']!='queued' and guest_queue_count(identity['owner_id'],c)>=policy['max_queued_tasks_per_guest']:
+            raise HTTPException(429,detail={'code':'guest_queue_limit_exceeded','message':f'游客最多保留 {int(policy["max_queued_tasks_per_guest"])} 个排队任务'})
         c.execute("UPDATE tasks SET status='queued',progress=0,error_code=NULL,error_message=NULL,output_path=NULL,output_size=NULL,finished=NULL,log_tail='',speed='',eta='',updated=? WHERE id=? AND owner_type='guest' AND owner_id=?",(stamp,task_id,identity['owner_id']))
         c.execute('COMMIT')
     except Exception:
@@ -710,37 +732,45 @@ def guest_task_options(payload,probed,policy):
     if probed.get('is_live') or mode=='live':guest_error('guest_live_not_allowed','游客不支持直播下载')
     duration=_probe_number(probed.get('duration'))
     if not duration:guest_error('guest_duration_unknown','游客任务需要可确认的媒体时长')
-    if duration>policy['max_video_duration_minutes']*60:guest_error('guest_duration_limit_exceeded','游客媒体最长支持 60 分钟')
-    limit=int(policy['max_file_size_gb']*1024**3);video_options=probed.get('video_options') or [];audio_options=probed.get('audio_options') or []
+    if duration>policy['max_video_duration_minutes']*60:
+        guest_error('guest_duration_limit_exceeded',f'游客媒体最长支持 {int(policy["max_video_duration_minutes"])} 分钟')
+    limit=gb_bytes(policy['max_file_size_gb']);video_options=probed.get('video_options') or [];audio_options=probed.get('audio_options') or []
     format_id=str(incoming.get('format_id') or '')
     strategy=str(probed.get('download_strategy') or '') or None
+    file_limit_msg=f'预计文件超过游客 {format_gb(policy["max_file_size_gb"])} GB 限制'
     if mode=='video':
         selected=next((item for item in video_options if str(item.get('format_id') or '')==format_id),None) if format_id else None
         if format_id and not selected:guest_error('guest_format_not_allowed','所选视频格式不可用')
         requested=_probe_number(incoming.get('resolution')) or policy['default_resolution']
         height=_probe_number(selected.get('height')) if selected else requested
-        if height>policy['max_resolution']:guest_error('guest_resolution_limit_exceeded','游客最高只支持 1080p')
-        if selected and _probe_number(selected.get('filesize'))>limit:guest_error('guest_file_limit_exceeded','预计文件超过游客 1 GB 限制')
+        if height>policy['max_resolution']:
+            guest_error('guest_resolution_limit_exceeded',f'游客最高只支持 {int(policy["max_resolution"])}p')
+        if selected and _probe_number(selected.get('filesize'))>limit:guest_error('guest_file_limit_exceeded',file_limit_msg)
         candidates=[_probe_number(item.get('filesize')) for item in video_options if _probe_number(item.get('height'))<=height and _probe_number(item.get('filesize'))]
-        if not selected and candidates and min(candidates)>limit:guest_error('guest_file_limit_exceeded','当前清晰度预计文件超过游客 1 GB 限制')
+        if not selected and candidates and min(candidates)>limit:
+            guest_error('guest_file_limit_exceeded',f'当前清晰度预计文件超过游客 {format_gb(policy["max_file_size_gb"])} GB 限制')
         options={'mode':'video','resolution':height,'format_id':str(selected.get('format_id')) if selected else None,'format_has_audio':bool(selected.get('has_audio')) if selected else False,'write_thumbnail':False,'embed_metadata':True,'cookie_id':None,'youtube_strategy':strategy}
     elif mode=='audio':
         selected=next((item for item in audio_options if str(item.get('format_id') or '')==format_id),None) if format_id else None
         if format_id and not selected:guest_error('guest_format_not_allowed','所选音频格式不可用')
-        if selected and _probe_number(selected.get('filesize'))>limit:guest_error('guest_file_limit_exceeded','预计文件超过游客 1 GB 限制')
+        if selected and _probe_number(selected.get('filesize'))>limit:guest_error('guest_file_limit_exceeded',file_limit_msg)
         audio_format=str(incoming.get('audio_format') or 'original');options={'mode':'audio','format_id':str(selected.get('format_id')) if selected else None,'audio_format':audio_format if audio_format in {'original','mp3','m4a','opus','wav','flac'} else 'original','write_thumbnail':False,'embed_metadata':True,'cookie_id':None,'youtube_strategy':strategy}
     elif mode=='thumbnail':options={'mode':'thumbnail','cookie_id':None,'youtube_strategy':strategy}
     else:
         languages=incoming.get('subtitle_languages');languages=languages if isinstance(languages,list) else ['zh-CN','zh','en']
         languages=[str(item) for item in languages if re.fullmatch(r'[A-Za-z0-9_-]{1,32}',str(item))][:10] or ['zh-CN','zh','en']
         ai_candidate=not bool(probed.get('subtitles'))
-        if ai_candidate and (not policy['allow_ai_transcription'] or duration>policy['ai_transcription_max_duration_minutes']*60):guest_error('guest_ai_duration_limit_exceeded','无平台字幕时，游客 AI 字幕最长支持 20 分钟')
+        if ai_candidate:
+            if not policy['allow_ai_transcription']:
+                guest_error('guest_ai_disabled','当前未启用游客 AI 字幕')
+            if duration>policy['ai_transcription_max_duration_minutes']*60:
+                guest_error('guest_ai_duration_limit_exceeded',f'无平台字幕时，游客 AI 字幕最长支持 {int(policy["ai_transcription_max_duration_minutes"])} 分钟')
         options={'mode':'subtitles','subtitle_languages':languages,'cookie_id':None,'guest_ai_candidate':ai_candidate,'youtube_strategy':strategy}
     return options
 def admit_guest_disk(policy):
     free=shutil.disk_usage(ROOT).free
-    if free<int(policy['emergency_free_gb'])*1024**3:guest_emergency_cleanup();free=shutil.disk_usage(ROOT).free
-    if free<int(policy['min_free_gb'])*1024**3:guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
+    if free<gb_bytes(policy['emergency_free_gb']):guest_emergency_cleanup();free=shutil.disk_usage(ROOT).free
+    if free<gb_bytes(policy['min_free_gb']):guest_error('guest_disk_space_low','服务器剩余空间不足，暂不接受游客任务',503)
 
 class Pass(BaseModel):password:str=Field(min_length=1,max_length=256)
 class PasswordChange(BaseModel):current_password:str=Field(min_length=1,max_length=256);new_password:str=Field(min_length=8,max_length=256)
@@ -804,7 +834,7 @@ def guest_health(identity:dict=Depends(guest_identity)):
     with con() as c:queued=int(c.execute("SELECT COUNT(*) AS n FROM tasks WHERE owner_type='guest' AND status='queued'").fetchone()['n'])
     return {
         'ok':True,
-        'accepting_guest_tasks':free>=int(policy['min_free_gb'])*1024**3 and guest_active_count()<policy['global_guest_concurrency'],
+        'accepting_guest_tasks':free>=gb_bytes(policy['min_free_gb']) and guest_active_count()<policy['global_guest_concurrency'],
         'queue_length':queued,
         'limits':{
             'max_file_size_gb':policy['max_file_size_gb'],

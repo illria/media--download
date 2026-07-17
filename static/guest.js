@@ -12,16 +12,17 @@
     guest_probe_required: '请先解析链接，再创建下载任务。',
     guest_probe_failed: '游客解析失败，请确认链接为公开可访问的媒体。',
     guest_disk_space_low: '服务器当前空间或队列不足，请稍后重试。',
-    guest_queue_limit_exceeded: '游客最多保留 2 个排队任务，请等待后再试。',
-    guest_file_limit_exceeded: '该选项预计超过游客 1 GB 限制。',
-    guest_resolution_limit_exceeded: '游客最高只支持 1080p。',
-    guest_duration_limit_exceeded: '游客媒体最长支持 60 分钟。',
+    guest_queue_limit_exceeded: '游客排队任务已达上限，请等待后再试。',
+    guest_file_limit_exceeded: '该选项预计超过游客文件大小限制。',
+    guest_resolution_limit_exceeded: '所选清晰度超过游客最高限制。',
+    guest_duration_limit_exceeded: '媒体时长超过游客允许范围。',
     guest_duration_unknown: '无法确认媒体时长，游客暂不支持该链接。',
     guest_live_not_allowed: '游客不支持直播下载。',
     guest_format_not_allowed: '所选格式不可用，请重新解析。',
-    guest_ai_duration_limit_exceeded: '无平台字幕时，游客 AI 字幕最长支持 20 分钟。',
-    GUEST_AI_DURATION_LIMIT: '游客 AI 字幕最长支持 20 分钟。',
-    GUEST_AI_HOURLY_LIMIT: '游客 AI 字幕每小时最多 3 次，请稍后再试。',
+    guest_ai_duration_limit_exceeded: '无平台字幕时，媒体超过游客 AI 字幕允许时长。',
+    guest_ai_disabled: '当前未启用游客 AI 字幕。',
+    GUEST_AI_DURATION_LIMIT: '媒体超过游客 AI 字幕允许时长。',
+    GUEST_AI_HOURLY_LIMIT: '游客 AI 字幕已达到每小时次数上限，请稍后再试。',
     GUEST_AI_BUSY: '游客 AI 字幕正在处理中，请稍后重试。',
     GUEST_AI_DISABLED: '当前未启用游客 AI 字幕。',
   };
@@ -126,7 +127,25 @@
     if (!payload) return fallback;
     if (typeof payload === 'string') return payload;
     if (payload.message) return payload.message;
-    if (payload.code && ERROR_MAP[payload.code]) return ERROR_MAP[payload.code];
+    if (payload.code) {
+      const limits = state.limits || DEFAULT_LIMITS;
+      if (payload.code === 'guest_file_limit_exceeded') {
+        return `该选项预计超过游客 ${limits.max_file_size_gb} GB 限制。`;
+      }
+      if (payload.code === 'guest_resolution_limit_exceeded') {
+        return `游客最高只支持 ${limits.max_resolution}p。`;
+      }
+      if (payload.code === 'guest_duration_limit_exceeded') {
+        return `游客媒体最长支持 ${limits.max_video_duration_minutes} 分钟。`;
+      }
+      if (payload.code === 'guest_ai_duration_limit_exceeded' || payload.code === 'GUEST_AI_DURATION_LIMIT') {
+        return `无平台字幕时，游客 AI 字幕最长支持 ${limits.ai_transcription_max_duration_minutes} 分钟。`;
+      }
+      if (payload.code === 'guest_ai_disabled' || payload.code === 'GUEST_AI_DISABLED') {
+        return '当前未启用游客 AI 字幕。';
+      }
+      if (ERROR_MAP[payload.code]) return ERROR_MAP[payload.code];
+    }
     if (payload.detail) return friendlyError(payload.detail, fallback);
     return fallback;
   }
