@@ -20,9 +20,7 @@ def build_command(core: Any, task: dict[str, Any], cookie: Path | None, strategy
         if proxy: command += ['--http-proxy',proxy]
         return command+[task['url'],options.get('stream_quality','best')]
     if guest:
-        command=['yt-dlp','--no-playlist','--force-ipv4','--socket-timeout','10','--retries','2','--fragment-retries','3','--extractor-retries','1','--js-runtimes','deno','--impersonate','chrome','--sleep-requests',str(config['request_sleep_seconds'])]
-        if core.yt(task['url']) and strategy.client: command += ['--extractor-args',f'youtube:player_client={strategy.client}']
-        if core.yt(task['url']) and strategy.use_pot: command += ['--extractor-args',f'youtubepot-bgutilhttp:base_url={yr.POT_PROVIDER_URL}']
+        command=yr.base(core,task['url'],None,strategy,guest=True,sleep_seconds=config['request_sleep_seconds'])
     else:
         command=yr.base(core,task['url'],cookie,strategy)
     command += ['--newline','--restrict-filenames','--paths',f'temp:{work}','--output',str(work/'%(title).180B [%(id)s].%(ext)s'),'--max-filesize',f"{config['max_file_size_gb']}G",'--progress-template','download:PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s']

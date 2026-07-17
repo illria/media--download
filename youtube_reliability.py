@@ -102,14 +102,21 @@ def strategies(core: Any, url: str, preferred: str | None = None) -> list[Strate
     return items
 
 
-def base(core: Any, url: str, cookie: Path | None, strategy: Strategy) -> list[str]:
+def base(core: Any, url: str, cookie: Path | None, strategy: Strategy, *, guest: bool = False, sleep_seconds: float | int | None = None) -> list[str]:
     cfg = core.settings()
     args = ['yt-dlp', '--no-playlist', '--force-ipv4', '--socket-timeout', '10', '--retries', '2', '--fragment-retries', '3', '--extractor-retries', '1', '--js-runtimes', 'deno', '--impersonate', 'chrome']
-    proxy = str(cfg.get('proxy_url') or '').strip()
-    if proxy:
-        args += ['--proxy', proxy]
-    if cookie:
-        args += ['--cookies', str(cookie)]
+    if guest:
+        if sleep_seconds is not None and float(sleep_seconds) > 0:
+            args += ['--sleep-requests', str(sleep_seconds)]
+    else:
+        proxy = str(cfg.get('proxy_url') or '').strip()
+        if proxy:
+            args += ['--proxy', proxy]
+        sleep = cfg.get('request_sleep_seconds')
+        if sleep:
+            args += ['--sleep-requests', str(sleep)]
+        if cookie:
+            args += ['--cookies', str(cookie)]
     extractor_args = []
     if core.yt(url) and strategy.client:
         extractor_args.append(f'player_client={strategy.client}')
@@ -148,7 +155,14 @@ def friendly_error(original: Any, text: str, url: str = '') -> tuple[str, str]:
     return original(text, url)
 
 
-def probe(core: Any, url: str, cookie_id: str | None) -> dict[str, Any]:
+GUEST_PROBE_FIELDS = (
+    'id', 'title', 'uploader', 'platform', 'duration', 'thumbnail', 'is_live', 'drm',
+    'video_options', 'audio_options', 'subtitles', 'webpage_url',
+    'download_strategy', 'download_strategy_label',
+)
+
+
+def probe(core: Any, url: str, cookie_id: str | None, *, guest: bool = False, sleep_seconds: float | int | None = None, safe_response: bool = False) -> dict[str, Any]:
     url = canonical_url(core, url)
     if core.yt(url):
         check = preflight(core)
@@ -158,13 +172,13 @@ def probe(core: Any, url: str, cookie_id: str | None) -> dict[str, Any]:
             raise RuntimeError('YOUTUBE_HTTPS_FAILED')
         if not check['deno'] or not check['ejs']:
             raise RuntimeError('YOUTUBE_RUNTIME_MISSING')
-    cookie = core.cpath(cookie_id)
+    cookie = None if guest else core.cpath(cookie_id)
     errors: list[str] = []
     raw = None
     selected = None
     try:
         for strategy in strategies(core, url):
-            command = base(core, url, cookie, strategy) + ['--dump-single-json', '--no-warnings', url]
+            command = base(core, url, cookie, strategy, guest=guest, sleep_seconds=sleep_seconds) + ['--dump-single-json', '--no-warnings', url]
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=strategy.timeout)
             except subprocess.TimeoutExpired:
@@ -188,4 +202,28 @@ def probe(core: Any, url: str, cookie_id: str | None) -> dict[str, Any]:
     videos, audios = core.simplify(raw.get('formats') or [])
     for item in videos + audios:
         item['strategy'] = selected.key
-    return {'id': raw.get('id'), 'title': raw.get('title'), 'uploader': raw.get('uploader') or raw.get('channel'), 'platform': raw.get('extractor_key') or raw.get('extractor'), 'duration': raw.get('duration'), 'thumbnail': raw.get('thumbnail'), 'is_live': bool(raw.get('is_live') or raw.get('live_status') == 'is_live'), 'drm': bool(raw.get('has_drm')), 'video_options': videos, 'audio_options': audios, 'subtitles': sorted(set(raw.get('subtitles') or {}) | set(raw.get('automatic_captions') or {})), 'webpage_url': raw.get('webpage_url') or url, 'download_strategy': selected.key, 'download_strategy_label': selected.label, 'pot_provider': pot_available(), 'preflight': preflight(core)}
+    payload = {
+        'id': raw.get('id'),
+        'title': raw.get('title'),
+        'uploader': raw.get('uploader') or raw.get('channel'),
+        'platform': raw.get('extractor_key') or raw.get('extractor'),
+        'duration': raw.get('duration'),
+        'thumbnail': raw.get('thumbnail'),
+        'is_live': bool(raw.get('is_live') or raw.get('live_status') == 'is_live'),
+        'drm': bool(raw.get('has_drm')),
+        'video_options': videos,
+        'audio_options': audios,
+        'subtitles': sorted(set(raw.get('subtitles') or {}) | set(raw.get('automatic_captions') or {})),
+        'webpage_url': raw.get('webpage_url') or url,
+        'download_strategy': selected.key,
+        'download_strategy_label': selected.label,
+        'pot_provider': pot_available(),
+        'preflight': preflight(core),
+    }
+    if guest or safe_response:
+        return {key: payload.get(key) for key in GUEST_PROBE_FIELDS}
+    return payload
+
+
+def guest_probe(core: Any, url: str, sleep_seconds: float | int | None = None) -> dict[str, Any]:
+    return probe(core, url, None, guest=True, sleep_seconds=sleep_seconds, safe_response=True)
