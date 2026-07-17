@@ -932,8 +932,17 @@ async def upload(platform:str,label:str,file:UploadFile=File(...)):
 def dc(i):
     with con() as c:r=c.execute('SELECT path FROM cookies WHERE id=?',(i,)).fetchone();Path(r['path']).unlink(missing_ok=True) if r else None;c.execute('DELETE FROM cookies WHERE id=?',(i,))
     return {'ok':True}
+def _html_page(name):
+    path=STATIC/name
+    if not path.is_file():raise HTTPException(404,'页面不存在')
+    return HTMLResponse(path.read_text(encoding='utf-8'))
 if STATIC.exists():app.mount('/assets',StaticFiles(directory=STATIC),name='assets')
-@app.get('/{path:path}',response_class=HTMLResponse)
-def front(path=''):return HTMLResponse((STATIC/'index.html').read_text() if (STATIC/'index.html').exists() else '<h1>Frontend missing</h1>')
+@app.get('/',response_class=HTMLResponse)
+@app.get('/index.html',response_class=HTMLResponse)
+def guest_page():return _html_page('index.html')
+@app.get('/admin',response_class=HTMLResponse)
+@app.get('/admin/',response_class=HTMLResponse)
+@app.get('/admin.html',response_class=HTMLResponse)
+def admin_page():return _html_page('admin.html')
 if __name__=='__main__':
     import uvicorn;uvicorn.run(app,host='0.0.0.0',port=PORT,workers=1)

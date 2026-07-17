@@ -1,0 +1,509 @@
+(() => {
+  const GUEST_LIMIT_BYTES = 1024 ** 3;
+  const RETENTION_MS = 30 * 60 * 1000;
+  const ERROR_MAP = {
+    guest_probe_required: '请先解析链接，再创建下载任务。',
+    guest_probe_failed: '游客解析失败，请确认链接为公开可访问的媒体。',
+    guest_disk_space_low: '服务器当前空间或队列不足，请稍后重试。',
+    guest_queue_limit_exceeded: '游客最多保留 2 个排队任务，请等待后再试。',
+    guest_file_limit_exceeded: '该选项预计超过游客 1 GB 限制。',
+    guest_resolution_limit_exceeded: '游客最高只支持 1080p。',
+    guest_duration_limit_exceeded: '游客媒体最长支持 60 分钟。',
+    guest_duration_unknown: '无法确认媒体时长，游客暂不支持该链接。',
+    guest_live_not_allowed: '游客不支持直播下载。',
+    guest_format_not_allowed: '所选格式不可用，请重新解析。',
+    guest_ai_duration_limit_exceeded: '无平台字幕时，游客 AI 字幕最长支持 20 分钟。',
+    GUEST_AI_DURATION_LIMIT: '游客 AI 字幕最长支持 20 分钟。',
+    GUEST_AI_HOURLY_LIMIT: '游客 AI 字幕每小时最多 3 次，请稍后再试。',
+    GUEST_AI_BUSY: '游客 AI 字幕正在处理中，请稍后重试。',
+    GUEST_AI_DISABLED: '当前未启用游客 AI 字幕。',
+  };
+  const STATUS_LABEL = {
+    queued: '排队中',
+    downloading: '下载中',
+    processing: '处理中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+    expired: '已过期',
+  };
+  const MODE_LABEL = {
+    video: '视频',
+    audio: '音频',
+    thumbnail: '封面',
+    subtitles: '字幕',
+  };
+
+  const state = {
+    probe: null,
+    selectedVideo: null,
+    selectedAudio: null,
+    tasks: [],
+    taskTimer: null,
+    healthTimer: null,
+    countdownTimer: null,
+    taskInFlight: false,
+    healthInFlight: false,
+  };
+
+  const el = {
+    url: document.getElementById('guestUrl'),
+    probeForm: document.getElementById('probeForm'),
+    probeBtn: document.getElementById('probeBtn'),
+    probeStatus: document.getElementById('probeStatus'),
+    health: document.getElementById('guestHealth'),
+    healthText: document.getElementById('guestHealthText'),
+    resultCard: document.getElementById('resultCard'),
+    resultTitle: document.getElementById('resultTitle'),
+    resultThumb: document.getElementById('resultThumb'),
+    resultMeta: document.getElementById('resultMeta'),
+    videoFormats: document.getElementById('videoFormats'),
+    audioFormats: document.getElementById('audioFormats'),
+    createStatus: document.getElementById('createStatus'),
+    taskList: document.getElementById('taskList'),
+    refreshTasksBtn: document.getElementById('refreshTasksBtn'),
+    manualRefreshBtn: document.getElementById('manualRefreshBtn'),
+  };
+
+  function text(value) {
+    return value == null ? '' : String(value);
+  }
+
+  function escapeHtml(value) {
+    return text(value).replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }[char]));
+  }
+
+  function formatSize(bytes) {
+    let n = Number(bytes || 0);
+    if (!n) return '';
+    for (const unit of ['B', 'KB', 'MB', 'GB']) {
+      if (n < 1024) return `${n.toFixed(n >= 10 || unit === 'B' ? 0 : 1)} ${unit}`;
+      n /= 1024;
+    }
+    return `${n.toFixed(1)} TB`;
+  }
+
+  function formatDuration(seconds) {
+    const total = Number(seconds || 0);
+    if (!total) return '未知';
+    const mins = Math.floor(total / 60);
+    const secs = Math.round(total % 60);
+    if (mins >= 60) {
+      const hours = Math.floor(mins / 60);
+      const rem = mins % 60;
+      return `${hours} 小时 ${rem} 分`;
+    }
+    return secs ? `${mins} 分 ${secs} 秒` : `${mins} 分钟`;
+  }
+
+  function formatTime(value) {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '-';
+    return date.toLocaleString();
+  }
+
+  function friendlyError(payload, fallback = '请求失败') {
+    if (!payload) return fallback;
+    if (typeof payload === 'string') return payload;
+    if (payload.message) return payload.message;
+    if (payload.code && ERROR_MAP[payload.code]) return ERROR_MAP[payload.code];
+    if (payload.detail) return friendlyError(payload.detail, fallback);
+    return fallback;
+  }
+
+  async function guestApi(path, options = {}) {
+    const opts = {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      ...options,
+      headers: { ...(options.headers || {}) },
+    };
+    if (opts.body && !(opts.body instanceof FormData) && typeof opts.body !== 'string') {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(opts.body);
+    }
+    const response = await fetch(path, opts);
+    let data = null;
+    const raw = await response.text();
+    try { data = raw ? JSON.parse(raw) : null; } catch { data = { detail: raw }; }
+    if (!response.ok) {
+      throw new Error(friendlyError(data && data.detail != null ? data.detail : data));
+    }
+    return data;
+  }
+
+  function setHealth(ok, message) {
+    const dot = el.health.querySelector('.dot');
+    el.healthText.textContent = message;
+    dot.className = `dot ${ok ? 'ok' : 'warn'}`;
+  }
+
+  async function loadHealth() {
+    if (state.healthInFlight) return;
+    state.healthInFlight = true;
+    try {
+      const data = await guestApi('/api/guest/health');
+      if (data.accepting_guest_tasks) {
+        setHealth(true, `服务可用 · 排队 ${Number(data.queue_length || 0)} 个`);
+      } else {
+        setHealth(false, `暂停接收新任务 · 排队 ${Number(data.queue_length || 0)} 个`);
+      }
+    } catch {
+      setHealth(false, '暂时无法获取服务状态');
+    } finally {
+      state.healthInFlight = false;
+    }
+  }
+
+  function chooseDefaultVideo(options) {
+    const list = (options || [])
+      .filter((item) => Number(item.height || 0) > 0 && Number(item.height || 0) <= 1080)
+      .slice()
+      .sort((a, b) => Number(b.height || 0) - Number(a.height || 0));
+    if (!list.length) return null;
+    const exact = list.find((item) => Number(item.height) === 720);
+    if (exact) return exact;
+    const below = list.filter((item) => Number(item.height) <= 720);
+    return below[0] || list[list.length - 1];
+  }
+
+  function renderFormats() {
+    const videos = (state.probe.video_options || [])
+      .filter((item) => Number(item.height || 0) <= 1080);
+    const audios = state.probe.audio_options || [];
+    el.videoFormats.innerHTML = videos.map((item) => {
+      const size = Number(item.filesize || 0);
+      const over = size > GUEST_LIMIT_BYTES;
+      const selected = state.selectedVideo && String(state.selectedVideo.format_id) === String(item.format_id);
+      return `<button type="button" class="format-btn${selected ? ' active' : ''}" data-video-format="${escapeHtml(item.format_id)}" ${over ? 'disabled' : ''}>
+        ${escapeHtml(item.label || `${item.height}p`)}
+        <small>${escapeHtml(item.ext || '')}${item.has_audio ? ' · 含音频' : ' · 无音频'}${size ? ` · ${escapeHtml(formatSize(size))}` : ''}${over ? ' · 预计超过游客限制' : ''}</small>
+      </button>`;
+    }).join('') || '<p class="muted">没有可用视频格式，可直接使用默认 720p 创建。</p>';
+
+    el.audioFormats.innerHTML = audios.map((item) => {
+      const size = Number(item.filesize || 0);
+      const over = size > GUEST_LIMIT_BYTES;
+      const selected = state.selectedAudio && String(state.selectedAudio.format_id) === String(item.format_id);
+      return `<button type="button" class="format-btn${selected ? ' active' : ''}" data-audio-format="${escapeHtml(item.format_id)}" ${over ? 'disabled' : ''}>
+        音频 ${escapeHtml(item.ext || 'm4a')}
+        <small>${item.abr ? `${escapeHtml(item.abr)} kbps` : '自动码率'}${size ? ` · ${escapeHtml(formatSize(size))}` : ''}${over ? ' · 预计超过游客限制' : ''}</small>
+      </button>`;
+    }).join('') || '<p class="muted">没有列出音频格式时，可直接创建默认音频任务。</p>';
+  }
+
+  function showProbeResult(probe) {
+    state.probe = probe;
+    state.selectedVideo = chooseDefaultVideo(probe.video_options || []);
+    state.selectedAudio = (probe.audio_options || [])[0] || null;
+    el.resultCard.classList.remove('hidden');
+    el.resultTitle.textContent = probe.title || '未命名媒体';
+    if (probe.thumbnail) {
+      el.resultThumb.src = probe.thumbnail;
+      el.resultThumb.alt = `${probe.title || '媒体'} 缩略图`;
+      el.resultThumb.classList.remove('hidden');
+    } else {
+      el.resultThumb.removeAttribute('src');
+      el.resultThumb.alt = '暂无缩略图';
+    }
+    const hasSubs = Array.isArray(probe.subtitles) && probe.subtitles.length > 0;
+    el.resultMeta.innerHTML = `
+      <div>平台：<strong>${escapeHtml(probe.platform || '-')}</strong></div>
+      <div>作者：<strong>${escapeHtml(probe.uploader || '-')}</strong></div>
+      <div>时长：<strong>${escapeHtml(formatDuration(probe.duration))}</strong></div>
+      <div>平台字幕：<strong>${hasSubs ? '有' : '无（将尝试 AI）'}</strong></div>
+      <div>解析策略：<strong>${escapeHtml(probe.download_strategy_label || probe.download_strategy || '自动')}</strong></div>
+    `;
+    renderFormats();
+    el.createStatus.textContent = '';
+  }
+
+  async function probeUrl() {
+    const url = el.url.value.trim();
+    if (!url) {
+      el.probeStatus.textContent = '请先粘贴媒体链接。';
+      el.probeStatus.className = 'live-region error';
+      return;
+    }
+    el.probeBtn.disabled = true;
+    el.probeStatus.textContent = '正在解析…';
+    el.probeStatus.className = 'live-region muted';
+    try {
+      const result = await guestApi('/api/guest/probe', {
+        method: 'POST',
+        body: { url },
+      });
+      showProbeResult(result);
+      el.probeStatus.textContent = '解析成功，可选择下载类型。';
+      el.probeStatus.className = 'live-region good';
+    } catch (error) {
+      el.probeStatus.textContent = error.message || ERROR_MAP.guest_probe_failed;
+      el.probeStatus.className = 'live-region error';
+      el.resultCard.classList.add('hidden');
+      state.probe = null;
+    } finally {
+      el.probeBtn.disabled = false;
+    }
+  }
+
+  async function createTask(mode) {
+    if (!state.probe) {
+      el.createStatus.textContent = ERROR_MAP.guest_probe_required;
+      el.createStatus.className = 'live-region error';
+      return;
+    }
+    const options = { mode };
+    if (mode === 'video') {
+      const selected = state.selectedVideo;
+      options.resolution = Number((selected && selected.height) || 720);
+      if (selected && selected.format_id) {
+        options.format_id = String(selected.format_id);
+        options.format_has_audio = !!selected.has_audio;
+      }
+    } else if (mode === 'audio') {
+      const selected = state.selectedAudio;
+      if (selected && selected.format_id) options.format_id = String(selected.format_id);
+      options.audio_format = 'mp3';
+    } else if (mode === 'subtitles') {
+      options.subtitle_languages = ['zh-CN', 'zh', 'en'];
+    }
+    el.createStatus.textContent = '正在创建任务…';
+    el.createStatus.className = 'live-region muted';
+    try {
+      await guestApi('/api/guest/tasks', {
+        method: 'POST',
+        body: {
+          url: state.probe.webpage_url || el.url.value.trim(),
+          options,
+        },
+      });
+      el.createStatus.textContent = '任务已创建。';
+      el.createStatus.className = 'live-region good';
+      await loadTasks(true);
+      schedulePolling();
+    } catch (error) {
+      el.createStatus.textContent = error.message || '创建任务失败';
+      el.createStatus.className = 'live-region error';
+    }
+  }
+
+  function countdownText(task) {
+    if (task.status !== 'completed' || !task.finished) {
+      return task.status === 'completed' ? '文件会按游客保留策略自动清理' : '';
+    }
+    const finished = new Date(task.finished).getTime();
+    if (Number.isNaN(finished)) return '文件会按游客保留策略自动清理';
+    const remain = finished + RETENTION_MS - Date.now();
+    if (remain <= 0) return '文件即将清理或已过期';
+    const mins = Math.max(1, Math.ceil(remain / 60000));
+    return `文件将在 ${mins} 分钟后自动清理`;
+  }
+
+  function taskActions(task) {
+    const id = escapeHtml(task.id);
+    if (task.status === 'queued') {
+      return `<button type="button" class="btn btn-danger btn-quiet" data-action="cancel" data-id="${id}">取消任务</button>
+              <button type="button" class="btn btn-ghost btn-quiet" data-action="delete" data-id="${id}">删除记录</button>`;
+    }
+    if (task.status === 'downloading' || task.status === 'processing') {
+      return `<button type="button" class="btn btn-danger btn-quiet" data-action="cancel" data-id="${id}">取消任务</button>`;
+    }
+    if (task.status === 'completed') {
+      const download = task.download_available
+        ? `<button type="button" class="btn btn-primary btn-quiet" data-action="download" data-id="${id}">下载文件</button>`
+        : '';
+      return `${download}<button type="button" class="btn btn-ghost btn-quiet" data-action="delete" data-id="${id}">删除任务</button>`;
+    }
+    if (task.status === 'failed' || task.status === 'cancelled') {
+      return `<button type="button" class="btn btn-secondary btn-quiet" data-action="retry" data-id="${id}">重试</button>
+              <button type="button" class="btn btn-ghost btn-quiet" data-action="delete" data-id="${id}">删除任务</button>`;
+    }
+    if (task.status === 'expired') {
+      return `<span class="muted">文件已过期，请重新解析原链接</span>
+              <button type="button" class="btn btn-ghost btn-quiet" data-action="delete" data-id="${id}">删除记录</button>`;
+    }
+    return '';
+  }
+
+  function renderTasks() {
+    if (!state.tasks.length) {
+      el.taskList.innerHTML = '<p class="muted">暂无任务。解析成功后可创建下载。</p>';
+      return;
+    }
+    el.taskList.innerHTML = state.tasks.map((task) => {
+      const progress = Math.max(0, Math.min(100, Number(task.progress || 0)));
+      const blocks = Math.round(progress / 5);
+      const bar = Array.from({ length: 20 }, (_, index) => (
+        index < blocks
+          ? '<span style="grid-column:span 1;background:linear-gradient(90deg,var(--gemini-blue),var(--gemini-cyan))"></span>'
+          : '<span style="grid-column:span 1;background:transparent"></span>'
+      )).join('');
+      const countdown = countdownText(task);
+      return `<article class="task">
+        <div class="task-top">
+          <strong>${escapeHtml(task.title || '未命名任务')}</strong>
+          <span class="tag">${escapeHtml(STATUS_LABEL[task.status] || task.status || '-')}</span>
+        </div>
+        <div class="row muted">
+          <span>${escapeHtml(task.platform || '-')}</span>
+          <span>${escapeHtml(MODE_LABEL[task.mode] || task.mode || '-')}</span>
+          ${task.resolution ? `<span>${escapeHtml(task.resolution)}p</span>` : ''}
+          <span>${escapeHtml(formatSize(task.output_size) || '大小未知')}</span>
+        </div>
+        <div class="progress" aria-hidden="true">${bar}</div>
+        <div class="row">
+          <span>${progress.toFixed(1)}%</span>
+          <span class="muted">${escapeHtml(task.speed || '')}</span>
+          <span class="muted">${escapeHtml(task.eta || '')}</span>
+        </div>
+        <div class="row muted">
+          <span>创建：${escapeHtml(formatTime(task.created))}</span>
+          <span>完成：${escapeHtml(formatTime(task.finished))}</span>
+        </div>
+        ${countdown ? `<p class="help">${escapeHtml(countdown)}</p>` : ''}
+        ${task.error_message ? `<p class="error">${escapeHtml(task.error_message)}</p>` : ''}
+        <div class="task-actions">${taskActions(task)}</div>
+      </article>`;
+    }).join('');
+  }
+
+  async function loadTasks(force = false) {
+    if (state.taskInFlight && !force) return;
+    state.taskInFlight = true;
+    try {
+      state.tasks = await guestApi('/api/guest/tasks') || [];
+      renderTasks();
+    } catch (error) {
+      el.taskList.innerHTML = `<p class="error">${escapeHtml(error.message || '无法加载任务')}</p>`;
+    } finally {
+      state.taskInFlight = false;
+    }
+  }
+
+  function hasActiveTasks() {
+    return state.tasks.some((task) => ['queued', 'downloading', 'processing'].includes(task.status));
+  }
+
+  function clearTimers() {
+    if (state.taskTimer) clearInterval(state.taskTimer);
+    if (state.healthTimer) clearInterval(state.healthTimer);
+    if (state.countdownTimer) clearInterval(state.countdownTimer);
+    state.taskTimer = null;
+    state.healthTimer = null;
+    state.countdownTimer = null;
+  }
+
+  function schedulePolling() {
+    clearTimers();
+    const visible = document.visibilityState === 'visible';
+    const active = hasActiveTasks();
+    const taskMs = !visible ? 60000 : (active ? 5000 : 15000);
+    const healthMs = !visible ? 120000 : (active ? 30000 : 60000);
+    state.taskTimer = setInterval(() => { loadTasks(false); }, taskMs);
+    state.healthTimer = setInterval(() => { loadHealth(); }, healthMs);
+    state.countdownTimer = setInterval(() => {
+      if (state.tasks.some((task) => task.status === 'completed')) renderTasks();
+    }, 30000);
+  }
+
+  async function downloadTask(id) {
+    try {
+      const response = await fetch(`/api/guest/tasks/${encodeURIComponent(id)}/download`, {
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error('文件不存在或尚未完成');
+      const blob = await response.blob();
+      const link = document.createElement('a');
+      const objectUrl = URL.createObjectURL(blob);
+      link.href = objectUrl;
+      link.download = 'media';
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      alert(error.message || '下载失败');
+    }
+  }
+
+  async function handleTaskAction(action, id) {
+    try {
+      if (action === 'download') {
+        await downloadTask(id);
+        return;
+      }
+      if (action === 'delete' && !confirm('确定删除该任务记录？')) return;
+      if (action === 'cancel') {
+        await guestApi(`/api/guest/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+      } else if (action === 'retry') {
+        await guestApi(`/api/guest/tasks/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+      } else if (action === 'delete') {
+        await guestApi(`/api/guest/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      }
+      await loadTasks(true);
+      schedulePolling();
+    } catch (error) {
+      alert(error.message || '操作失败');
+    }
+  }
+
+  el.probeForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    probeUrl();
+  });
+
+  el.url.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      probeUrl();
+    }
+  });
+
+  el.resultCard.addEventListener('click', (event) => {
+    const modeBtn = event.target.closest('[data-mode]');
+    if (modeBtn) {
+      createTask(modeBtn.getAttribute('data-mode'));
+      return;
+    }
+    const videoBtn = event.target.closest('[data-video-format]');
+    if (videoBtn) {
+      const id = videoBtn.getAttribute('data-video-format');
+      state.selectedVideo = (state.probe.video_options || []).find((item) => String(item.format_id) === id) || null;
+      renderFormats();
+      return;
+    }
+    const audioBtn = event.target.closest('[data-audio-format]');
+    if (audioBtn) {
+      const id = audioBtn.getAttribute('data-audio-format');
+      state.selectedAudio = (state.probe.audio_options || []).find((item) => String(item.format_id) === id) || null;
+      renderFormats();
+    }
+  });
+
+  el.taskList.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-action][data-id]');
+    if (!button) return;
+    handleTaskAction(button.getAttribute('data-action'), button.getAttribute('data-id'));
+  });
+
+  el.refreshTasksBtn.addEventListener('click', () => { loadTasks(true); });
+  el.manualRefreshBtn.addEventListener('click', () => { loadTasks(true); loadHealth(); });
+
+  document.addEventListener('visibilitychange', () => {
+    schedulePolling();
+    if (document.visibilityState === 'visible') {
+      loadTasks(true);
+      loadHealth();
+    }
+  });
+
+  window.addEventListener('beforeunload', clearTimers);
+
+  loadHealth();
+  loadTasks(true).then(schedulePolling);
+})();

@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理员控制台 · Media Download Hub</title>
+  <link rel="stylesheet" href="/assets/theme.css">
+</head>
+<body>
+  <div id="loginView" class="login-wrap">
+    <div class="login-card">
+      <h1>Media Download Hub</h1>
+      <p class="muted">管理员控制台</p>
+      <form id="loginForm">
+        <div class="field">
+          <label for="adminPassword">管理员密码</label>
+          <input id="adminPassword" type="password" autocomplete="current-password" required>
+        </div>
+        <p id="loginError" class="error live-region" aria-live="polite"></p>
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn-primary" type="submit">登录</button>
+          <a class="btn btn-ghost" href="/">返回游客页面</a>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="appView" class="admin-shell hidden">
+    <header class="topbar">
+      <div class="brand">
+        <h2 id="pageTitle">仪表盘</h2>
+        <p class="muted">管理员后台</p>
+      </div>
+      <div class="top-actions">
+        <span id="adminHealth" class="pill" aria-live="polite">
+          <span class="dot idle" aria-hidden="true"></span>
+          <span id="adminHealthText">检查中</span>
+        </span>
+        <span class="tag admin">管理员</span>
+        <a class="btn btn-ghost btn-quiet" href="/">返回游客页面</a>
+        <button id="logoutBtn" class="btn btn-secondary btn-quiet" type="button">退出登录</button>
+      </div>
+    </header>
+
+    <div class="admin-layout">
+      <nav class="nav" aria-label="管理员导航">
+        <button type="button" class="active" data-page="dashboard">仪表盘</button>
+        <button type="button" data-page="probe">解析下载</button>
+        <button type="button" data-page="tasks">全部任务</button>
+        <button type="button" data-page="cookies">Cookie</button>
+        <button type="button" data-page="koofr">Koofr</button>
+        <button type="button" data-page="settings">系统设置</button>
+        <button type="button" data-page="guest-policy">游客策略</button>
+        <button type="button" data-page="security">安全设置</button>
+      </nav>
+
+      <main>
+        <section id="page-dashboard" class="section active">
+          <div class="card">
+            <div class="card-head"><h2>系统仪表盘</h2><button id="refreshDashBtn" class="btn btn-secondary btn-quiet" type="button">刷新</button></div>
+            <div id="dashStats" class="stat-grid"></div>
+            <div id="dashKoofr" class="details" style="margin-top:14px"></div>
+          </div>
+        </section>
+
+        <section id="page-probe" class="section">
+          <div class="card">
+            <h2>管理员解析</h2>
+            <form id="adminProbeForm">
+              <div class="field">
+                <label for="adminUrl">媒体链接</label>
+                <textarea id="adminUrl" rows="3" placeholder="支持 Cookie 的媒体链接"></textarea>
+              </div>
+              <div class="field">
+                <label for="probeCookie">Cookie</label>
+                <select id="probeCookie"><option value="">不使用 Cookie</option></select>
+              </div>
+              <button class="btn btn-primary" type="submit" id="adminProbeBtn">开始解析</button>
+              <p id="adminProbeStatus" class="live-region muted" aria-live="polite"></p>
+            </form>
+          </div>
+          <div id="adminResult" class="card hidden">
+            <h2 id="adminResultTitle"></h2>
+            <p id="adminResultMeta" class="muted"></p>
+            <div class="action-grid" style="margin-top:12px">
+              <button type="button" class="btn btn-primary" data-admin-mode="video">下载视频</button>
+              <button type="button" class="btn btn-secondary" data-admin-mode="audio">下载音频</button>
+              <button type="button" class="btn btn-secondary" data-admin-mode="thumbnail">下载封面</button>
+              <button type="button" class="btn btn-secondary" data-admin-mode="subtitles">获取字幕</button>
+              <button type="button" class="btn btn-secondary" data-admin-mode="live">直播录制</button>
+            </div>
+            <div id="adminFormats" class="format-grid" style="margin-top:14px"></div>
+            <p id="adminCreateStatus" class="live-region muted" aria-live="polite"></p>
+          </div>
+        </section>
+
+        <section id="page-tasks" class="section">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h2>全部任务</h2>
+                <p class="muted">包含管理员与游客任务。游客任务不会显示 Koofr 保存。</p>
+              </div>
+              <button id="refreshTasksBtn" class="btn btn-secondary btn-quiet" type="button">刷新</button>
+            </div>
+            <div id="adminTaskList"></div>
+          </div>
+        </section>
+
+        <section id="page-cookies" class="section">
+          <div class="card">
+            <h2>Cookie 管理</h2>
+            <p class="muted">仅上传 Netscape cookies.txt，不会在页面显示 Cookie 内容。建议小于 2 MB。</p>
+            <form id="cookieForm" class="grid-2">
+              <div class="field">
+                <label for="cookiePlatform">平台</label>
+                <input id="cookiePlatform" value="youtube">
+              </div>
+              <div class="field">
+                <label for="cookieLabel">备注</label>
+                <input id="cookieLabel" placeholder="我的 YouTube Cookie">
+              </div>
+              <div class="field" style="grid-column:1 / -1">
+                <label for="cookieFile">Cookie 文件（.txt）</label>
+                <input id="cookieFile" type="file" accept=".txt,text/plain">
+              </div>
+              <button class="btn btn-primary" type="submit" id="cookieUploadBtn">上传 Cookie</button>
+            </form>
+            <p id="cookieStatus" class="live-region muted" aria-live="polite"></p>
+            <div id="cookieList" class="table-like" style="margin-top:14px"></div>
+          </div>
+        </section>
+
+        <section id="page-koofr" class="section">
+          <div class="card">
+            <div class="card-head"><h2>Koofr 状态</h2><button id="refreshKoofrBtn" class="btn btn-secondary btn-quiet" type="button">刷新</button></div>
+            <div id="koofrPanel"></div>
+            <p class="help" style="margin-top:12px">任务级 Koofr 操作在“全部任务”中按需查看，不会每 3 秒轮询全部任务。</p>
+          </div>
+        </section>
+
+        <section id="page-settings" class="section">
+          <div class="card">
+            <h2>系统设置</h2>
+            <form id="settingsForm" class="grid-2">
+              <div class="field"><label for="maxFile">最大文件 GB</label><input id="maxFile" type="number" step="0.1" min="0.1"></div>
+              <div class="field"><label for="maxRes">最高分辨率</label><input id="maxRes" type="number" min="144"></div>
+              <div class="field"><label for="retention">保留小时</label><input id="retention" type="number" min="1"></div>
+              <div class="field"><label for="minFree">最低剩余空间 GB</label><input id="minFree" type="number" step="0.1" min="0.1"></div>
+              <div class="field"><label for="sleep">请求间隔秒</label><input id="sleep" type="number" step="0.1" min="0"></div>
+              <div class="field"><label for="proxy">代理</label><input id="proxy" type="text" autocomplete="off" placeholder="留空保持现有代理"></div>
+            </form>
+            <div class="row" style="margin-top:8px">
+              <button id="saveSettingsBtn" class="btn btn-primary" type="button">保存系统设置</button>
+              <button id="clearProxyBtn" class="btn btn-danger" type="button">清除代理</button>
+            </div>
+            <p id="settingsMsg" class="live-region muted" aria-live="polite"></p>
+          </div>
+          <div class="card">
+            <h2>AI 字幕设置</h2>
+            <p id="aiStatus" class="muted">正在检查 AI 字幕配置…</p>
+            <div class="field">
+              <label for="aiKey">硅基流动 API Key</label>
+              <input id="aiKey" type="password" autocomplete="off" placeholder="留空保持现有 Key">
+            </div>
+            <div class="row">
+              <button id="saveAiBtn" class="btn btn-primary" type="button">保存 API Key</button>
+              <button id="clearAiBtn" class="btn btn-danger" type="button">清除 API Key</button>
+            </div>
+            <p class="help" style="margin-top:10px">获取字幕会优先使用平台字幕；没有字幕时才调用 AI。Key 不会回显。</p>
+          </div>
+        </section>
+
+        <section id="page-guest-policy" class="section">
+          <div class="card">
+            <h2>游客策略</h2>
+            <p class="muted">仅提交 guest_policy，不会覆盖其他系统设置。带“安全保护项”标签的开关默认关闭。</p>
+            <form id="guestPolicyForm" class="grid-2">
+              <div class="field"><label for="gp_max_file_size_gb">单文件最大 GB</label><input id="gp_max_file_size_gb" type="number" step="0.1"></div>
+              <div class="field"><label for="gp_default_resolution">默认分辨率</label><input id="gp_default_resolution" type="number"></div>
+              <div class="field"><label for="gp_max_resolution">最高分辨率</label><input id="gp_max_resolution" type="number"></div>
+              <div class="field"><label for="gp_retention_minutes">保留分钟</label><input id="gp_retention_minutes" type="number"></div>
+              <div class="field"><label for="gp_min_free_gb">最低剩余空间 GB</label><input id="gp_min_free_gb" type="number" step="0.1"></div>
+              <div class="field"><label for="gp_emergency_free_gb">紧急保护线 GB</label><input id="gp_emergency_free_gb" type="number" step="0.1"></div>
+              <div class="field"><label for="gp_request_sleep_seconds">请求间隔秒</label><input id="gp_request_sleep_seconds" type="number" step="0.1"></div>
+              <div class="field"><label for="gp_max_active_tasks_per_guest">每游客活跃任务上限</label><input id="gp_max_active_tasks_per_guest" type="number"></div>
+              <div class="field"><label for="gp_max_queued_tasks_per_guest">每游客排队上限</label><input id="gp_max_queued_tasks_per_guest" type="number"></div>
+              <div class="field"><label for="gp_global_guest_concurrency">全局游客并发</label><input id="gp_global_guest_concurrency" type="number"></div>
+              <div class="field"><label for="gp_max_video_duration_minutes">最长媒体分钟</label><input id="gp_max_video_duration_minutes" type="number"></div>
+              <div class="field"><label for="gp_ai_transcription_max_duration_minutes">AI 字幕最长分钟</label><input id="gp_ai_transcription_max_duration_minutes" type="number"></div>
+              <div class="field"><label for="gp_ai_transcription_global_concurrency">AI 全局并发</label><input id="gp_ai_transcription_global_concurrency" type="number"></div>
+              <div class="field"><label for="gp_ai_transcription_hourly_limit_per_guest">AI 每小时次数</label><input id="gp_ai_transcription_hourly_limit_per_guest" type="number"></div>
+              <div class="field"><label for="gp_allow_ai_transcription">允许 AI 字幕</label>
+                <select id="gp_allow_ai_transcription"><option value="true">开启</option><option value="false">关闭</option></select>
+              </div>
+              <div class="field"><label for="gp_allow_cookie">允许 Cookie <span class="tag protect">安全保护项</span></label>
+                <select id="gp_allow_cookie"><option value="false">关闭</option><option value="true">开启</option></select>
+              </div>
+              <div class="field"><label for="gp_allow_koofr">允许 Koofr <span class="tag protect">安全保护项</span></label>
+                <select id="gp_allow_koofr"><option value="false">关闭</option><option value="true">开启</option></select>
+              </div>
+              <div class="field"><label for="gp_allow_live_download">允许直播 <span class="tag protect">安全保护项</span></label>
+                <select id="gp_allow_live_download"><option value="false">关闭</option><option value="true">开启</option></select>
+              </div>
+            </form>
+            <button id="saveGuestPolicyBtn" class="btn btn-primary" type="button">保存游客策略</button>
+            <p id="guestPolicyMsg" class="live-region muted" aria-live="polite"></p>
+          </div>
+        </section>
+
+        <section id="page-security" class="section">
+          <div class="card">
+            <h2>安全设置</h2>
+            <div id="defaultPasswordAlert" class="alert hidden">当前仍在使用默认管理员密码，请立即修改。</div>
+            <p id="authStatusText" class="muted">检查登录状态…</p>
+            <form id="passwordForm" class="grid-2">
+              <div class="field"><label for="currentPassword">当前密码</label><input id="currentPassword" type="password" autocomplete="current-password"></div>
+              <div class="field"><label for="newPassword">新密码</label><input id="newPassword" type="password" autocomplete="new-password"></div>
+              <div class="field"><label for="confirmPassword">确认新密码</label><input id="confirmPassword" type="password" autocomplete="new-password"></div>
+            </form>
+            <div class="row">
+              <button id="changePasswordBtn" class="btn btn-primary" type="button">修改密码</button>
+              <button id="logoutBtn2" class="btn btn-secondary" type="button">退出当前登录</button>
+            </div>
+            <p id="passwordMsg" class="live-region muted" aria-live="polite"></p>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <script src="/assets/admin.js" defer></script>
+</body>
+</html>
