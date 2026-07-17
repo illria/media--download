@@ -267,17 +267,72 @@ def install(core: Any) -> None:
         return {"path": path, "language": lang, "auto": bool(auto), "size": path.stat().st_size if path.is_file() else 0}
 
     def score_subtitle(meta: dict[str, Any], source: str, target: str, prefer_target: bool) -> tuple:
-        lang = normalize_lang(meta.get("language"))
-        auto = 1 if meta.get("auto") else 0
-        if prefer_target and lang == target:
-            return (0, auto, -int(meta.get("size") or 0))
-        if source != "auto" and lang == source:
-            return (1, auto, -int(meta.get("size") or 0))
-        if lang == "en":
-            return (2, auto, -int(meta.get("size") or 0))
-        if lang in languages:
-            return (3, auto, -int(meta.get("size") or 0))
-        return (9, auto, -int(meta.get("size") or 0))
+        lang = normalize_lang(meta.get("language")) or "und"
+        auto = bool(meta.get("auto"))
+        size_rank = -int(meta.get("size") or 0)
+        supported = lang in languages
+        is_en = lang == "en"
+        is_target = bool(target and lang == target)
+        is_source = bool(source and source != "auto" and lang == source)
+
+        if prefer_target:
+            # translated mode: target first, then explicit source, then manual before auto.
+            if is_target and not auto:
+                rank = 0
+            elif is_target and auto:
+                rank = 1
+            elif is_source and not auto:
+                rank = 2
+            elif is_source and auto:
+                rank = 3
+            elif is_en and not auto:
+                rank = 4
+            elif supported and not auto:
+                rank = 5
+            elif is_en and auto:
+                rank = 6
+            elif supported and auto:
+                rank = 7
+            elif not auto:
+                rank = 8
+            else:
+                rank = 9
+            return (rank, size_rank)
+
+        if source and source != "auto":
+            # explicit source language
+            if is_source and not auto:
+                rank = 0
+            elif is_source and auto:
+                rank = 1
+            elif is_en and not auto:
+                rank = 2
+            elif supported and not auto:
+                rank = 3
+            elif is_en and auto:
+                rank = 4
+            elif supported and auto:
+                rank = 5
+            elif not auto:
+                rank = 6
+            else:
+                rank = 7
+            return (rank, size_rank)
+
+        # source=auto
+        if is_en and not auto:
+            rank = 0
+        elif supported and not auto:
+            rank = 1
+        elif is_en and auto:
+            rank = 2
+        elif supported and auto:
+            rank = 3
+        elif not auto:
+            rank = 4
+        else:
+            rank = 5
+        return (rank, size_rank)
 
     def download_platform_subtitles(task: dict[str, Any], work: Path, cookie: Path | None, source: str, target: str) -> list[dict[str, Any]]:
         candidates = language_candidates(source, target)
@@ -314,7 +369,8 @@ def install(core: Any) -> None:
         return ranked[0]
 
     def parse_srt(text: str) -> list[dict[str, str]]:
-        blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n").strip())
+        normalized = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n").strip()
+        blocks = re.split(r"\n\s*\n", normalized)
         cues: list[dict[str, str]] = []
         seen_ids: set[str] = set()
         generated = 0
@@ -324,8 +380,9 @@ def install(core: Any) -> None:
                 continue
             idx = 0
             cue_id = None
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", lines[0].strip()) and "-->" not in lines[0]:
-                cue_id = lines[0].strip()
+            first = lines[0].strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", first) and "-->" not in first:
+                cue_id = first
                 idx = 1
             if idx >= len(lines) or "-->" not in lines[idx]:
                 continue
@@ -428,7 +485,10 @@ def install(core: Any) -> None:
         system_prompt = (
             "You are a subtitle translator. Translate subtitle text only. "
             "Keep natural spoken language. Do not explain. Do not summarize. "
-            "Do not add content. Preserve IDs exactly. Return pure JSON only."
+            "Do not add content. Preserve IDs exactly. Return pure JSON only. "
+            "Preserve subtitle markup and markers such as <i>...</i>, <b>...</b>, {\\an8}, music symbols, and speaker prefixes. "
+            "Do not translate URLs, code snippets, or non-translatable identifiers. "
+            "Never modify cue IDs or invent timestamps."
         )
         user_prompt = json.dumps({
             "source_language": source_language or "auto",

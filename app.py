@@ -128,24 +128,46 @@ def normalize_guest_policy(raw=None):
     for key in ('allow_ai_transcription','allow_subtitle_translation','allow_cookie','allow_koofr','allow_live_download'):policy[key]=_guest_bool(policy[key],GUEST_DEFAULT[key])
     return policy
 def guest_policy():return normalize_guest_policy(settings().get('guest_policy'))
-def normalize_subtitle_language(value,allow_auto=False,default='zh-CN'):
-    code=str(value or default).strip()
+def normalize_subtitle_language(value,allow_auto=False,default='zh-CN',required=False,field_name='language'):
+    aliases={'zh':'zh-CN','zh-Hans':'zh-CN','zh-Hant':'zh-TW','cn':'zh-CN','jp':'ja','kr':'ko'}
+    if value is None or str(value).strip()=='':
+        if required:raise ValueError(field_name)
+        return default
+    code=str(value).strip()
     if allow_auto and code=='auto':return 'auto'
     if code in SUBTITLE_LANGUAGES:return code
-    aliases={'zh':'zh-CN','zh-Hans':'zh-CN','zh-Hant':'zh-TW','cn':'zh-CN','jp':'ja','kr':'ko'}
-    return aliases.get(code,default if default in SUBTITLE_LANGUAGES or (allow_auto and default=='auto') else 'zh-CN')
-def normalize_subtitle_output_mode(value,default='translated'):
-    mode=str(value or default).strip().lower()
-    return mode if mode in SUBTITLE_OUTPUT_MODES else default
+    if code in aliases:return aliases[code]
+    raise ValueError(field_name)
+def normalize_subtitle_output_mode(value,default='translated',required=False):
+    if value is None or str(value).strip()=='':
+        if required:raise ValueError('output_mode')
+        return default
+    mode=str(value).strip().lower()
+    if mode in SUBTITLE_OUTPUT_MODES:return mode
+    raise ValueError('output_mode')
 def subtitle_options_from_payload(incoming,policy=None,guest=False,probed=None):
     policy=policy or guest_policy()
-    source=normalize_subtitle_language(incoming.get('subtitle_source_language'),allow_auto=True,default='auto')
-    target=normalize_subtitle_language(incoming.get('subtitle_target_language'),allow_auto=False,default='zh-CN')
-    output_mode=normalize_subtitle_output_mode(incoming.get('subtitle_output_mode'),'translated')
+    incoming=incoming if isinstance(incoming,dict) else {}
+    source_present='subtitle_source_language' in incoming and incoming.get('subtitle_source_language') is not None and str(incoming.get('subtitle_source_language')).strip()!=''
+    target_present='subtitle_target_language' in incoming and incoming.get('subtitle_target_language') is not None and str(incoming.get('subtitle_target_language')).strip()!=''
+    mode_present='subtitle_output_mode' in incoming and incoming.get('subtitle_output_mode') is not None and str(incoming.get('subtitle_output_mode')).strip()!=''
+    try:
+        source=normalize_subtitle_language(incoming.get('subtitle_source_language'),allow_auto=True,default='auto',required=source_present,field_name='source')
+    except ValueError:
+        if guest:guest_error('subtitle_source_language_unsupported','不支持的源语言')
+        raise HTTPException(400,detail={'code':'SUBTITLE_SOURCE_LANGUAGE_UNSUPPORTED','message':'不支持的源语言'})
+    try:
+        target=normalize_subtitle_language(incoming.get('subtitle_target_language'),allow_auto=False,default='zh-CN',required=target_present,field_name='target')
+    except ValueError:
+        if guest:guest_error('subtitle_target_language_unsupported','不支持的目标语言')
+        raise HTTPException(400,detail={'code':'SUBTITLE_TARGET_LANGUAGE_UNSUPPORTED','message':'不支持的目标语言'})
+    try:
+        output_mode=normalize_subtitle_output_mode(incoming.get('subtitle_output_mode'),default='translated',required=mode_present)
+    except ValueError:
+        if guest:guest_error('subtitle_output_mode_unsupported','不支持的字幕输出模式')
+        raise HTTPException(400,detail={'code':'SUBTITLE_OUTPUT_MODE_UNSUPPORTED','message':'不支持的字幕输出模式'})
     if guest and not policy.get('allow_subtitle_translation') and output_mode!='original':
         guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
-    if output_mode=='original':
-        target=target if target in SUBTITLE_LANGUAGES else 'zh-CN'
     options={
         'subtitle_source_language':source,
         'subtitle_target_language':target,
