@@ -89,6 +89,60 @@
               <button type="button" class="btn btn-secondary" data-admin-mode="subtitles">获取字幕</button>
               <button type="button" class="btn btn-secondary" data-admin-mode="live">直播录制</button>
             </div>
+            <div id="adminSubtitleOptions" class="grid-3" style="margin-top:14px">
+              <div class="field">
+                <label for="adminSubtitleOutputMode">字幕输出</label>
+                <select id="adminSubtitleOutputMode">
+                  <option value="original">仅原字幕</option>
+                  <option value="translated" selected>翻译字幕</option>
+                  <option value="bilingual">双语字幕</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="adminSubtitleSourceLanguage">源语言</label>
+                <select id="adminSubtitleSourceLanguage">
+                  <option value="auto" selected>自动选择</option>
+                  <option value="zh-CN">简体中文</option>
+                  <option value="zh-TW">繁体中文</option>
+                  <option value="en">英语</option>
+                  <option value="ja">日语</option>
+                  <option value="ko">韩语</option>
+                  <option value="vi">越南语</option>
+                  <option value="th">泰语</option>
+                  <option value="fr">法语</option>
+                  <option value="de">德语</option>
+                  <option value="es">西班牙语</option>
+                  <option value="pt">葡萄牙语</option>
+                  <option value="ru">俄语</option>
+                  <option value="ar">阿拉伯语</option>
+                  <option value="id">印度尼西亚语</option>
+                  <option value="tr">土耳其语</option>
+                  <option value="it">意大利语</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="adminSubtitleTargetLanguage">目标语言</label>
+                <select id="adminSubtitleTargetLanguage">
+                  <option value="zh-CN" selected>简体中文</option>
+                  <option value="zh-TW">繁体中文</option>
+                  <option value="en">英语</option>
+                  <option value="ja">日语</option>
+                  <option value="ko">韩语</option>
+                  <option value="vi">越南语</option>
+                  <option value="th">泰语</option>
+                  <option value="fr">法语</option>
+                  <option value="de">德语</option>
+                  <option value="es">西班牙语</option>
+                  <option value="pt">葡萄牙语</option>
+                  <option value="ru">俄语</option>
+                  <option value="ar">阿拉伯语</option>
+                  <option value="id">印度尼西亚语</option>
+                  <option value="tr">土耳其语</option>
+                  <option value="it">意大利语</option>
+                </select>
+              </div>
+            </div>
+            <p class="help" style="margin-top:10px">优先使用平台已有目标语言字幕；没有目标语言字幕时使用 AI 翻译；平台完全没有字幕时会先尝试 AI 语音转写。</p>
             <div id="adminFormats" class="format-grid" style="margin-top:14px"></div>
             <p id="adminCreateStatus" class="live-region muted" aria-live="polite"></p>
           </div>
@@ -157,17 +211,47 @@
             <p id="settingsMsg" class="live-region muted" aria-live="polite"></p>
           </div>
           <div class="card">
-            <h2>AI 字幕设置</h2>
+            <h2>AI 字幕与翻译</h2>
             <p id="aiStatus" class="muted">正在检查 AI 字幕配置…</p>
             <div class="field">
               <label for="aiKey">硅基流动 API Key</label>
               <input id="aiKey" type="password" autocomplete="off" placeholder="留空保持现有 Key">
             </div>
-            <div class="row">
-              <button id="saveAiBtn" class="btn btn-primary" type="button">保存 API Key</button>
+            <div class="grid-2">
+              <div class="field">
+                <label for="asrModelDisplay">语音识别模型</label>
+                <input id="asrModelDisplay" type="text" value="FunAudioLLM/SenseVoiceSmall" disabled>
+              </div>
+              <div class="field">
+                <label for="translationEnabled">字幕翻译</label>
+                <select id="translationEnabled">
+                  <option value="true">启用</option>
+                  <option value="false">关闭</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="translationModel">翻译主模型</label>
+                <select id="translationModel"></select>
+              </div>
+              <div class="field">
+                <label for="translationFallback1">备用模型 1</label>
+                <select id="translationFallback1"></select>
+              </div>
+              <div class="field">
+                <label for="translationFallback2">备用模型 2</label>
+                <select id="translationFallback2"></select>
+              </div>
+              <div class="field">
+                <label for="translationFallback3">备用模型 3</label>
+                <select id="translationFallback3"></select>
+              </div>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <button id="saveAiBtn" class="btn btn-primary" type="button">保存 AI 设置</button>
               <button id="clearAiBtn" class="btn btn-danger" type="button">清除 API Key</button>
             </div>
-            <p class="help" style="margin-top:10px">获取字幕会优先使用平台字幕；没有字幕时才调用 AI。Key 不会回显。</p>
+            <p class="help" style="margin-top:10px">API Key 与语音识别/字幕翻译共用。Key 不会回显；仅修改模型不会清除 Key。</p>
+            <p id="aiMsg" class="live-region muted" aria-live="polite"></p>
           </div>
         </section>
 
@@ -193,6 +277,13 @@
               <div class="field"><label for="gp_allow_ai_transcription">允许 AI 字幕</label>
                 <select id="gp_allow_ai_transcription"><option value="true">开启</option><option value="false">关闭</option></select>
               </div>
+              <div class="field"><label for="gp_allow_subtitle_translation">允许字幕翻译</label>
+                <select id="gp_allow_subtitle_translation"><option value="true">开启</option><option value="false">关闭</option></select>
+              </div>
+              <div class="field"><label for="gp_subtitle_translation_max_duration_minutes">平台字幕翻译最长分钟</label><input id="gp_subtitle_translation_max_duration_minutes" type="number" min="1" required></div>
+              <div class="field"><label for="gp_subtitle_translation_hourly_limit_per_guest">每游客每小时翻译次数</label><input id="gp_subtitle_translation_hourly_limit_per_guest" type="number" min="1" required></div>
+              <div class="field"><label for="gp_subtitle_translation_global_concurrency">游客翻译全局并发</label><input id="gp_subtitle_translation_global_concurrency" type="number" min="1" max="5" required></div>
+              <div class="field"><label for="gp_subtitle_translation_max_target_languages">最大目标语言数</label><input id="gp_subtitle_translation_max_target_languages" type="number" value="1" disabled></div>
               <div class="field"><label for="gp_allow_cookie">允许 Cookie <span class="tag protect">当前版本固定关闭</span></label>
                 <select id="gp_allow_cookie" disabled><option value="false" selected>关闭</option></select>
               </div>

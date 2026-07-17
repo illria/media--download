@@ -329,7 +329,9 @@
       options.format_id = null;
       options.format_has_audio = false;
       options.audio_format = 'original';
-      options.subtitle_languages = ['zh-CN', 'zh', 'en'];
+      options.subtitle_output_mode = document.getElementById('adminSubtitleOutputMode')?.value || 'translated';
+      options.subtitle_source_language = document.getElementById('adminSubtitleSourceLanguage')?.value || 'auto';
+      options.subtitle_target_language = document.getElementById('adminSubtitleTargetLanguage')?.value || 'zh-CN';
     } else if (mode === 'live') {
       options.engine = 'streamlink';
       options.format_id = null;
@@ -572,6 +574,10 @@
       ai_transcription_global_concurrency: 'gp_ai_transcription_global_concurrency',
       ai_transcription_hourly_limit_per_guest: 'gp_ai_transcription_hourly_limit_per_guest',
       allow_ai_transcription: 'gp_allow_ai_transcription',
+      allow_subtitle_translation: 'gp_allow_subtitle_translation',
+      subtitle_translation_max_duration_minutes: 'gp_subtitle_translation_max_duration_minutes',
+      subtitle_translation_hourly_limit_per_guest: 'gp_subtitle_translation_hourly_limit_per_guest',
+      subtitle_translation_global_concurrency: 'gp_subtitle_translation_global_concurrency',
     };
     Object.entries(map).forEach(([key, id]) => {
       const node = document.getElementById(id);
@@ -579,6 +585,8 @@
       if (node.tagName === 'SELECT') node.value = String(!!policy[key]);
       else node.value = policy[key] ?? '';
     });
+    const maxTargets = document.getElementById('gp_subtitle_translation_max_target_languages');
+    if (maxTargets) maxTargets.value = '1';
     ['gp_allow_cookie', 'gp_allow_koofr', 'gp_allow_live_download'].forEach((id) => {
       const node = document.getElementById(id);
       if (node) {
@@ -614,6 +622,11 @@
       ai_transcription_max_duration_minutes: readNumber('gp_ai_transcription_max_duration_minutes', { min: 1, integer: true }),
       ai_transcription_global_concurrency: readNumber('gp_ai_transcription_global_concurrency', { min: 1, integer: true }),
       ai_transcription_hourly_limit_per_guest: readNumber('gp_ai_transcription_hourly_limit_per_guest', { min: 1, integer: true }),
+      allow_subtitle_translation: document.getElementById('gp_allow_subtitle_translation').value === 'true',
+      subtitle_translation_max_duration_minutes: readNumber('gp_subtitle_translation_max_duration_minutes', { min: 1, integer: true }),
+      subtitle_translation_hourly_limit_per_guest: readNumber('gp_subtitle_translation_hourly_limit_per_guest', { min: 1, integer: true }),
+      subtitle_translation_global_concurrency: readNumber('gp_subtitle_translation_global_concurrency', { min: 1, integer: true }),
+      subtitle_translation_max_target_languages: 1,
       allow_cookie: false,
       allow_koofr: false,
       allow_live_download: false,
@@ -694,38 +707,99 @@
     try {
       const data = await adminApi('/api/admin/transcription/settings');
       status.textContent = data.configured
-        ? `AI 字幕已配置 · 模型 ${data.model || '-'} · 来源 ${data.source || '-'}`
+        ? `AI 字幕已配置 · 识别 ${data.asr_model || data.model || '-'} · 来源 ${data.source || '-'}`
         : 'AI 字幕未配置：只能下载平台已有字幕';
       status.className = data.configured ? 'good' : 'muted';
+      const models = data.supported_translation_models || [
+        'tencent/Hunyuan-MT-7B',
+        'Qwen/Qwen3.5-4B',
+        'Qwen/Qwen2.5-7B-Instruct',
+        'THUDM/GLM-4-9B-0414',
+      ];
+      const fill = (id, selected, allowNone = false) => {
+        const node = document.getElementById(id);
+        if (!node) return;
+        node.innerHTML = (allowNone ? '<option value="">无</option>' : '') + models.map((model) => (
+          `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`
+        )).join('');
+        if (selected && models.includes(selected)) node.value = selected;
+        else if (allowNone) node.value = selected || '';
+      };
+      document.getElementById('translationEnabled').value = data.translation_enabled === false ? 'false' : 'true';
+      fill('translationModel', data.translation_model || 'tencent/Hunyuan-MT-7B', false);
+      const fallbacks = data.translation_fallback_models || [];
+      fill('translationFallback1', fallbacks[0] || '', true);
+      fill('translationFallback2', fallbacks[1] || '', true);
+      fill('translationFallback3', fallbacks[2] || '', true);
+      const asr = document.getElementById('asrModelDisplay');
+      if (asr) asr.value = data.asr_model || data.model || 'FunAudioLLM/SenseVoiceSmall';
     } catch {
       status.textContent = '无法读取 AI 字幕配置';
       status.className = 'error';
     }
   }
 
+  function collectTranslationModels() {
+    const primary = document.getElementById('translationModel')?.value || '';
+    const fallbacks = [
+      document.getElementById('translationFallback1')?.value || '',
+      document.getElementById('translationFallback2')?.value || '',
+      document.getElementById('translationFallback3')?.value || '',
+    ].filter(Boolean);
+    const unique = [];
+    for (const item of fallbacks) {
+      if (item !== primary && !unique.includes(item)) unique.push(item);
+    }
+    if (unique.length !== fallbacks.filter((item) => item && item !== primary).length) {
+      throw new Error('备用模型不能重复，且不能与主模型相同');
+    }
+    return { translation_model: primary, translation_fallback_models: unique };
+  }
+
   async function saveAiKey() {
+    const msg = document.getElementById('aiMsg');
     const input = document.getElementById('aiKey');
     const apiKey = input.value.trim();
-    if (!apiKey) {
-      alert('请输入 API Key，或使用清除按钮');
-      return;
+    try {
+      const models = collectTranslationModels();
+      const body = {
+        translation_enabled: document.getElementById('translationEnabled').value === 'true',
+        ...models,
+      };
+      if (apiKey) body.api_key = apiKey;
+      await adminApi('/api/admin/transcription/settings', {
+        method: 'PUT',
+        body,
+      });
+      input.value = '';
+      await loadAiSettings();
+      if (msg) {
+        msg.textContent = 'AI 字幕与翻译设置已保存';
+        msg.className = 'live-region good';
+      }
+    } catch (error) {
+      if (msg) {
+        msg.textContent = error.message || '保存失败';
+        msg.className = 'live-region error';
+      } else {
+        alert(error.message || '保存失败');
+      }
     }
-    await adminApi('/api/admin/transcription/settings', {
-      method: 'PUT',
-      body: { api_key: apiKey },
-    });
-    input.value = '';
-    await loadAiSettings();
   }
 
   async function clearAiKey() {
     if (!confirm('确定清除硅基流动 API Key？')) return;
+    const msg = document.getElementById('aiMsg');
     await adminApi('/api/admin/transcription/settings', {
       method: 'PUT',
       body: { clear: true },
     });
     document.getElementById('aiKey').value = '';
     await loadAiSettings();
+    if (msg) {
+      msg.textContent = 'API Key 已清除';
+      msg.className = 'live-region good';
+    }
   }
 
   async function loadAuthStatus() {
@@ -897,6 +971,13 @@
   document.getElementById('clearAiBtn').addEventListener('click', () => {
     clearAiKey().catch((error) => alert(error.message || '清除失败'));
   });
+  const adminSubtitleOutput = document.getElementById('adminSubtitleOutputMode');
+  if (adminSubtitleOutput) {
+    adminSubtitleOutput.addEventListener('change', () => {
+      const target = document.getElementById('adminSubtitleTargetLanguage');
+      if (target) target.disabled = adminSubtitleOutput.value === 'original';
+    });
+  }
   document.getElementById('changePasswordBtn').addEventListener('click', changePassword);
   document.getElementById('cookieForm').addEventListener('submit', uploadCookie);
 

@@ -7,6 +7,14 @@
     max_video_duration_minutes: 60,
     allow_ai_transcription: true,
     ai_transcription_max_duration_minutes: 20,
+    allow_subtitle_translation: true,
+    subtitle_translation_max_duration_minutes: 60,
+    subtitle_translation_hourly_limit_per_guest: 3,
+    supported_subtitle_languages: {
+      'zh-CN': '简体中文', 'zh-TW': '繁体中文', en: '英语', ja: '日语', ko: '韩语',
+      vi: '越南语', th: '泰语', fr: '法语', de: '德语', es: '西班牙语',
+      pt: '葡萄牙语', ru: '俄语', ar: '阿拉伯语', id: '印度尼西亚语', tr: '土耳其语', it: '意大利语',
+    },
   };
   const ERROR_MAP = {
     guest_probe_required: '请先解析链接，再创建下载任务。',
@@ -21,11 +29,21 @@
     guest_format_not_allowed: '所选格式不可用，请重新解析。',
     guest_ai_duration_limit_exceeded: '无平台字幕时，媒体超过游客 AI 字幕允许时长。',
     guest_ai_disabled: '当前未启用游客 AI 字幕。',
+    guest_translation_disabled: '当前未启用游客字幕翻译。',
+    guest_translation_hourly_limit: '游客字幕翻译已达到每小时次数上限。',
+    guest_translation_busy: '字幕翻译正在处理中，请稍后重试。',
+    guest_translation_duration_limit: '该视频超过游客字幕翻译时长限制。',
     GUEST_AI_DURATION_LIMIT: '媒体超过游客 AI 字幕允许时长。',
     GUEST_AI_HOURLY_LIMIT: '游客 AI 字幕已达到每小时次数上限，请稍后再试。',
     GUEST_AI_BUSY: '游客 AI 字幕正在处理中，请稍后重试。',
     GUEST_AI_DISABLED: '当前未启用游客 AI 字幕。',
+    GUEST_TRANSLATION_DISABLED: '当前未启用游客字幕翻译。',
+    GUEST_TRANSLATION_HOURLY_LIMIT: '游客字幕翻译已达到每小时次数上限。',
+    GUEST_TRANSLATION_BUSY: '字幕翻译正在处理中，请稍后重试。',
+    GUEST_TRANSLATION_DURATION_LIMIT: '该视频超过游客字幕翻译时长限制。',
+    SUBTITLE_TRANSLATION_FAILED: '翻译失败，已保留原字幕。',
   };
+  const OUTPUT_LABEL = { original: '仅原字幕', translated: '翻译字幕', bilingual: '双语字幕' };
   const STATUS_LABEL = {
     queued: '排队中',
     downloading: '下载中',
@@ -77,6 +95,11 @@
     chipMaxRes: document.getElementById('chipMaxRes'),
     chipRetention: document.getElementById('chipRetention'),
     chipAiLimit: document.getElementById('chipAiLimit'),
+    subtitleOptions: document.getElementById('subtitleOptions'),
+    subtitleOutputMode: document.getElementById('subtitleOutputMode'),
+    subtitleSourceLanguage: document.getElementById('subtitleSourceLanguage'),
+    subtitleTargetLanguage: document.getElementById('subtitleTargetLanguage'),
+    subtitleHelp: document.getElementById('subtitleHelp'),
   };
 
   function text(value) {
@@ -162,6 +185,37 @@
     return Number(state.limits.default_resolution || DEFAULT_LIMITS.default_resolution);
   }
 
+  function fillLanguageSelects() {
+    const langs = state.limits.supported_subtitle_languages || DEFAULT_LIMITS.supported_subtitle_languages;
+    if (!el.subtitleSourceLanguage || !el.subtitleTargetLanguage || !el.subtitleOutputMode) return;
+    const sourceValue = el.subtitleSourceLanguage.value || 'auto';
+    const targetValue = el.subtitleTargetLanguage.value || 'zh-CN';
+    const modeValue = el.subtitleOutputMode.value || 'translated';
+    el.subtitleSourceLanguage.innerHTML = '<option value="auto">自动选择</option>' + Object.entries(langs).map(([code, label]) => (
+      `<option value="${escapeHtml(code)}">${escapeHtml(label)}</option>`
+    )).join('');
+    el.subtitleTargetLanguage.innerHTML = Object.entries(langs).map(([code, label]) => (
+      `<option value="${escapeHtml(code)}">${escapeHtml(label)}</option>`
+    )).join('');
+    el.subtitleSourceLanguage.value = sourceValue;
+    el.subtitleTargetLanguage.value = targetValue in langs ? targetValue : 'zh-CN';
+    if (!state.limits.allow_subtitle_translation) {
+      el.subtitleOutputMode.innerHTML = '<option value="original" selected>仅原字幕</option>';
+      el.subtitleTargetLanguage.disabled = true;
+      if (el.subtitleHelp) el.subtitleHelp.textContent = '当前未启用游客字幕翻译，仅可下载原字幕。';
+    } else {
+      el.subtitleOutputMode.innerHTML = `
+        <option value="original">仅原字幕</option>
+        <option value="translated">翻译字幕</option>
+        <option value="bilingual">双语字幕</option>`;
+      el.subtitleOutputMode.value = ['original', 'translated', 'bilingual'].includes(modeValue) ? modeValue : 'translated';
+      el.subtitleTargetLanguage.disabled = el.subtitleOutputMode.value === 'original';
+      if (el.subtitleHelp) {
+        el.subtitleHelp.textContent = `优先使用平台已有目标语言字幕；没有目标语言字幕时使用 AI 翻译；平台完全没有字幕时会先尝试 AI 语音转写。翻译最长 ${state.limits.subtitle_translation_max_duration_minutes} 分钟。`;
+      }
+    }
+  }
+
   function applyLimits(limits) {
     if (!limits || typeof limits !== 'object') return;
     state.limits = {
@@ -172,6 +226,10 @@
       max_video_duration_minutes: Number(limits.max_video_duration_minutes) || DEFAULT_LIMITS.max_video_duration_minutes,
       allow_ai_transcription: limits.allow_ai_transcription !== false,
       ai_transcription_max_duration_minutes: Number(limits.ai_transcription_max_duration_minutes) || DEFAULT_LIMITS.ai_transcription_max_duration_minutes,
+      allow_subtitle_translation: limits.allow_subtitle_translation !== false,
+      subtitle_translation_max_duration_minutes: Number(limits.subtitle_translation_max_duration_minutes) || DEFAULT_LIMITS.subtitle_translation_max_duration_minutes,
+      subtitle_translation_hourly_limit_per_guest: Number(limits.subtitle_translation_hourly_limit_per_guest) || DEFAULT_LIMITS.subtitle_translation_hourly_limit_per_guest,
+      supported_subtitle_languages: limits.supported_subtitle_languages || DEFAULT_LIMITS.supported_subtitle_languages,
     };
     if (el.chipFileLimit) el.chipFileLimit.textContent = `单文件最大 ${state.limits.max_file_size_gb} GB`;
     if (el.chipMaxRes) el.chipMaxRes.textContent = `最高 ${state.limits.max_resolution}p`;
@@ -181,6 +239,7 @@
         ? `AI 字幕最长 ${state.limits.ai_transcription_max_duration_minutes} 分钟`
         : 'AI 字幕未启用';
     }
+    fillLanguageSelects();
     if (state.probe) {
       state.selectedVideo = chooseDefaultVideo(state.probe.video_options || []);
       renderFormats();
@@ -349,7 +408,10 @@
       if (selected && selected.format_id) options.format_id = String(selected.format_id);
       options.audio_format = 'mp3';
     } else if (mode === 'subtitles') {
-      options.subtitle_languages = ['zh-CN', 'zh', 'en'];
+      const outputMode = el.subtitleOutputMode?.value || 'translated';
+      options.subtitle_output_mode = state.limits.allow_subtitle_translation ? outputMode : 'original';
+      options.subtitle_source_language = el.subtitleSourceLanguage?.value || 'auto';
+      options.subtitle_target_language = el.subtitleTargetLanguage?.value || 'zh-CN';
     }
     el.createStatus.textContent = '正在创建任务…';
     el.createStatus.className = 'live-region muted';
@@ -431,6 +493,8 @@
           <span>${escapeHtml(task.platform || '-')}</span>
           <span>${escapeHtml(MODE_LABEL[task.mode] || task.mode || '-')}</span>
           ${task.resolution ? `<span>${escapeHtml(task.resolution)}p</span>` : ''}
+          ${task.mode === 'subtitles' ? `<span>${escapeHtml(OUTPUT_LABEL[task.subtitle_output_mode] || task.subtitle_output_mode || '字幕')}</span>` : ''}
+          ${task.mode === 'subtitles' && task.subtitle_source_language ? `<span>${escapeHtml(task.subtitle_source_language)} → ${escapeHtml(task.subtitle_target_language || '-')}</span>` : ''}
           <span>${escapeHtml(formatSize(task.output_size) || '大小未知')}</span>
         </div>
         <div class="progress" aria-hidden="true">${bar}</div>
@@ -584,6 +648,11 @@
 
   window.addEventListener('beforeunload', clearTimers);
 
+  if (el.subtitleOutputMode) {
+    el.subtitleOutputMode.addEventListener('change', () => {
+      if (el.subtitleTargetLanguage) el.subtitleTargetLanguage.disabled = el.subtitleOutputMode.value === 'original' || !state.limits.allow_subtitle_translation;
+    });
+  }
   applyLimits(DEFAULT_LIMITS);
   loadHealth();
   loadTasks(true).then(() => schedulePolling(true));

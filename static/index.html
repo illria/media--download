@@ -66,9 +66,29 @@
             <button type="button" class="btn btn-primary" data-mode="video">下载视频</button>
             <button type="button" class="btn btn-secondary" data-mode="audio">下载音频</button>
             <button type="button" class="btn btn-secondary" data-mode="thumbnail">下载封面</button>
-            <button type="button" class="btn btn-secondary" data-mode="subtitles" title="优先下载平台字幕；没有字幕时将尝试 AI 生成">获取字幕</button>
+            <button type="button" class="btn btn-secondary" data-mode="subtitles" title="优先使用平台字幕，必要时翻译或 AI 转写">获取字幕</button>
           </div>
-          <p class="help" style="margin-top:10px">获取字幕：优先下载平台字幕；没有字幕时将尝试 AI 生成。</p>
+          <div id="subtitleOptions" class="grid-3" style="margin-top:14px">
+            <div class="field">
+              <label for="subtitleOutputMode">字幕输出</label>
+              <select id="subtitleOutputMode">
+                <option value="original">仅原字幕</option>
+                <option value="translated" selected>翻译字幕</option>
+                <option value="bilingual">双语字幕</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="subtitleSourceLanguage">源语言</label>
+              <select id="subtitleSourceLanguage">
+                <option value="auto" selected>自动选择</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="subtitleTargetLanguage">目标语言</label>
+              <select id="subtitleTargetLanguage"></select>
+            </div>
+          </div>
+          <p id="subtitleHelp" class="help" style="margin-top:10px">优先使用平台已有目标语言字幕；没有目标语言字幕时使用 AI 翻译；平台完全没有字幕时会先尝试 AI 语音转写。</p>
           <div id="videoFormats" class="format-grid" aria-label="视频清晰度"></div>
           <div id="audioFormats" class="format-grid" aria-label="音频格式" style="margin-top:10px"></div>
           <p id="createStatus" class="live-region muted" aria-live="polite"></p>

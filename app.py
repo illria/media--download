@@ -20,10 +20,13 @@ def secret(path,make):
     if path.exists() and path.read_text().strip(): return path.read_text().strip()
     v=make(); path.write_text(v); os.chmod(path,0o600); return v
 SECRET=os.getenv('SECRET_KEY') or secret(DB.parent/'secret.key',lambda:secrets.token_urlsafe(48)); FKEY=os.getenv('COOKIE_ENCRYPTION_KEY') or secret(DB.parent/'cookie.key',lambda:Fernet.generate_key().decode()); F=Fernet(FKEY.encode()); TOK=URLSafeTimedSerializer(SECRET,salt='media-hub'); GUEST_TOK=URLSafeTimedSerializer(SECRET,salt='media-hub-guest')
-GUEST_DEFAULT={'max_file_size_gb':1,'default_resolution':720,'max_resolution':1080,'retention_minutes':30,'min_free_gb':2,'emergency_free_gb':1,'request_sleep_seconds':5,'max_active_tasks_per_guest':1,'max_queued_tasks_per_guest':2,'global_guest_concurrency':1,'max_video_duration_minutes':60,'allow_ai_transcription':True,'ai_transcription_max_duration_minutes':20,'ai_transcription_global_concurrency':1,'ai_transcription_hourly_limit_per_guest':3,'allow_cookie':False,'allow_koofr':False,'allow_live_download':False}
+GUEST_DEFAULT={'max_file_size_gb':1,'default_resolution':720,'max_resolution':1080,'retention_minutes':30,'min_free_gb':2,'emergency_free_gb':1,'request_sleep_seconds':5,'max_active_tasks_per_guest':1,'max_queued_tasks_per_guest':2,'global_guest_concurrency':1,'max_video_duration_minutes':60,'allow_ai_transcription':True,'ai_transcription_max_duration_minutes':20,'ai_transcription_global_concurrency':1,'ai_transcription_hourly_limit_per_guest':3,'allow_subtitle_translation':True,'subtitle_translation_max_duration_minutes':60,'subtitle_translation_hourly_limit_per_guest':3,'subtitle_translation_global_concurrency':1,'subtitle_translation_max_target_languages':1,'allow_cookie':False,'allow_koofr':False,'allow_live_download':False}
 DEFAULT={'max_file_size_gb':5,'retention_hours':24,'min_free_gb':5,'max_resolution':1080,'proxy_url':'','youtube_compatibility_mode':True,'request_sleep_seconds':1,'guest_policy':GUEST_DEFAULT}
-GUEST_SESSION_COOKIE='media_guest_session'; GUEST_SESSION_MAX_AGE=60*60*24*30; GUEST_PROBE_TTL=10*60; GUEST_AI_EVENT='guest_ai_transcription'
-ACTIVE={}; GUEST_PROBES={}; GUEST_AI_ACTIVE=set(); LOCK=threading.RLock(); STOP=threading.Event()
+GUEST_SESSION_COOKIE='media_guest_session'; GUEST_SESSION_MAX_AGE=60*60*24*30; GUEST_PROBE_TTL=10*60; GUEST_AI_EVENT='guest_ai_transcription'; GUEST_TRANSLATION_EVENT='guest_subtitle_translation'
+SUBTITLE_LANGUAGES={'zh-CN':'简体中文','zh-TW':'繁体中文','en':'英语','ja':'日语','ko':'韩语','vi':'越南语','th':'泰语','fr':'法语','de':'德语','es':'西班牙语','pt':'葡萄牙语','ru':'俄语','ar':'阿拉伯语','id':'印度尼西亚语','tr':'土耳其语','it':'意大利语'}
+SUBTITLE_SOURCE_LANGUAGES={'auto':'自动选择',**SUBTITLE_LANGUAGES}
+SUBTITLE_OUTPUT_MODES={'original':'仅原字幕','translated':'翻译字幕','bilingual':'双语字幕'}
+ACTIVE={}; GUEST_PROBES={}; GUEST_AI_ACTIVE=set(); SUBTITLE_TRANSLATION_ACTIVE=set(); LOCK=threading.RLock(); STOP=threading.Event()
 def con():
     c=sqlite3.connect(DB,timeout=30,check_same_thread=False); c.row_factory=sqlite3.Row; c.execute('PRAGMA journal_mode=WAL'); return c
 def init():
@@ -118,9 +121,37 @@ def normalize_guest_policy(raw=None):
     policy['ai_transcription_max_duration_minutes']=_guest_number(policy['ai_transcription_max_duration_minutes'],20,1,240,True)
     policy['ai_transcription_global_concurrency']=_guest_number(policy['ai_transcription_global_concurrency'],1,1,10,True)
     policy['ai_transcription_hourly_limit_per_guest']=_guest_number(policy['ai_transcription_hourly_limit_per_guest'],3,1,100,True)
-    for key in ('allow_ai_transcription','allow_cookie','allow_koofr','allow_live_download'):policy[key]=_guest_bool(policy[key],GUEST_DEFAULT[key])
+    policy['subtitle_translation_max_duration_minutes']=_guest_number(policy['subtitle_translation_max_duration_minutes'],60,1,240,True)
+    policy['subtitle_translation_hourly_limit_per_guest']=_guest_number(policy['subtitle_translation_hourly_limit_per_guest'],3,1,100,True)
+    policy['subtitle_translation_global_concurrency']=_guest_number(policy['subtitle_translation_global_concurrency'],1,1,5,True)
+    policy['subtitle_translation_max_target_languages']=1
+    for key in ('allow_ai_transcription','allow_subtitle_translation','allow_cookie','allow_koofr','allow_live_download'):policy[key]=_guest_bool(policy[key],GUEST_DEFAULT[key])
     return policy
 def guest_policy():return normalize_guest_policy(settings().get('guest_policy'))
+def normalize_subtitle_language(value,allow_auto=False,default='zh-CN'):
+    code=str(value or default).strip()
+    if allow_auto and code=='auto':return 'auto'
+    if code in SUBTITLE_LANGUAGES:return code
+    aliases={'zh':'zh-CN','zh-Hans':'zh-CN','zh-Hant':'zh-TW','cn':'zh-CN','jp':'ja','kr':'ko'}
+    return aliases.get(code,default if default in SUBTITLE_LANGUAGES or (allow_auto and default=='auto') else 'zh-CN')
+def normalize_subtitle_output_mode(value,default='translated'):
+    mode=str(value or default).strip().lower()
+    return mode if mode in SUBTITLE_OUTPUT_MODES else default
+def subtitle_options_from_payload(incoming,policy=None,guest=False):
+    policy=policy or guest_policy()
+    source=normalize_subtitle_language(incoming.get('subtitle_source_language'),allow_auto=True,default='auto')
+    target=normalize_subtitle_language(incoming.get('subtitle_target_language'),allow_auto=False,default='zh-CN')
+    output_mode=normalize_subtitle_output_mode(incoming.get('subtitle_output_mode'),'translated')
+    if guest and not policy.get('allow_subtitle_translation') and output_mode!='original':
+        guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
+    if output_mode=='original':
+        target=target if target in SUBTITLE_LANGUAGES else 'zh-CN'
+    return {
+        'subtitle_source_language':source,
+        'subtitle_target_language':target,
+        'subtitle_output_mode':output_mode,
+        'subtitle_languages':[source] if source!='auto' else [target,'en','zh-CN','zh','ja','ko'],
+    }
 def is_guest_task(task):return bool(task and task.get('owner_type')=='guest')
 def task_policy(task):
     if not is_guest_task(task):return settings()
@@ -293,6 +324,9 @@ def guest_task_view(task):
         'expires_at':guest_task_expires_at(task),
         'mode':options.get('mode'),
         'resolution':options.get('resolution'),
+        'subtitle_source_language':options.get('subtitle_source_language'),
+        'subtitle_target_language':options.get('subtitle_target_language'),
+        'subtitle_output_mode':options.get('subtitle_output_mode'),
         'download_available':guest_download_available(task),
     }
 def task_directory_size(path):
@@ -319,6 +353,12 @@ def guest_ai_hourly_count(owner_id,connection=None):
     cutoff=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
     query="SELECT COUNT(*) AS n FROM guest_rate_events WHERE owner_id=? AND event_type=? AND created>=?"
     args=(owner_id,GUEST_AI_EVENT,cutoff)
+    if connection is not None:return int(connection.execute(query,args).fetchone()['n'])
+    with con() as c:return int(c.execute(query,args).fetchone()['n'])
+def guest_translation_hourly_count(owner_id,connection=None):
+    cutoff=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    query="SELECT COUNT(*) AS n FROM guest_rate_events WHERE owner_id=? AND event_type=? AND created>=?"
+    args=(owner_id,GUEST_TRANSLATION_EVENT,cutoff)
     if connection is not None:return int(connection.execute(query,args).fetchone()['n'])
     with con() as c:return int(c.execute(query,args).fetchone()['n'])
 def consume_guest_ai_quota(task):
@@ -359,6 +399,34 @@ def start_guest_ai(task):
     return True
 def release_guest_ai_slot(task_id):
     with LOCK:GUEST_AI_ACTIVE.discard(task_id)
+def start_guest_translation(task):
+    if not is_guest_task(task):return False
+    policy=task_policy(task)
+    if not policy.get('allow_subtitle_translation',True):
+        raise RuntimeError(json.dumps({'code':'GUEST_TRANSLATION_DISABLED','message':'当前未启用游客字幕翻译。'},ensure_ascii=False))
+    with LOCK:
+        if len(SUBTITLE_TRANSLATION_ACTIVE)>=int(policy['subtitle_translation_global_concurrency']):
+            raise RuntimeError(json.dumps({'code':'GUEST_TRANSLATION_BUSY','message':'字幕翻译正在处理中，请稍后重试。'},ensure_ascii=False))
+        SUBTITLE_TRANSLATION_ACTIVE.add(task['id'])
+    owner_id=str(task.get('owner_id') or '')
+    c=con(); c.isolation_level=None
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        used=guest_translation_hourly_count(owner_id,c)
+        limit=int(policy['subtitle_translation_hourly_limit_per_guest'])
+        if used>=limit:
+            raise RuntimeError(json.dumps({'code':'GUEST_TRANSLATION_HOURLY_LIMIT','message':f'游客字幕翻译每小时最多 {limit} 次。'},ensure_ascii=False))
+        c.execute('INSERT INTO guest_rate_events(id,owner_id,event_type,task_id,created) VALUES(?,?,?,?,?)',(uuid.uuid4().hex,owner_id,GUEST_TRANSLATION_EVENT,task.get('id'),now()))
+        c.execute('COMMIT')
+    except Exception:
+        try:c.execute('ROLLBACK')
+        except sqlite3.Error:pass
+        with LOCK:SUBTITLE_TRANSLATION_ACTIVE.discard(task['id'])
+        raise
+    finally:c.close()
+    return True
+def release_guest_translation_slot(task_id):
+    with LOCK:SUBTITLE_TRANSLATION_ACTIVE.discard(task_id)
 def patch(i,**v):
     if not v:return
     v['updated']=now(); q=','.join(k+'=?' for k in v)
@@ -757,15 +825,19 @@ def guest_task_options(payload,probed,policy):
         audio_format=str(incoming.get('audio_format') or 'original');options={'mode':'audio','format_id':str(selected.get('format_id')) if selected else None,'audio_format':audio_format if audio_format in {'original','mp3','m4a','opus','wav','flac'} else 'original','write_thumbnail':False,'embed_metadata':True,'cookie_id':None,'youtube_strategy':strategy}
     elif mode=='thumbnail':options={'mode':'thumbnail','cookie_id':None,'youtube_strategy':strategy}
     else:
-        languages=incoming.get('subtitle_languages');languages=languages if isinstance(languages,list) else ['zh-CN','zh','en']
-        languages=[str(item) for item in languages if re.fullmatch(r'[A-Za-z0-9_-]{1,32}',str(item))][:10] or ['zh-CN','zh','en']
+        subtitle_opts=subtitle_options_from_payload(incoming,policy,guest=True)
         ai_candidate=not bool(probed.get('subtitles'))
         if ai_candidate:
             if not policy['allow_ai_transcription']:
                 guest_error('guest_ai_disabled','当前未启用游客 AI 字幕')
             if duration>policy['ai_transcription_max_duration_minutes']*60:
                 guest_error('guest_ai_duration_limit_exceeded',f'无平台字幕时，游客 AI 字幕最长支持 {int(policy["ai_transcription_max_duration_minutes"])} 分钟')
-        options={'mode':'subtitles','subtitle_languages':languages,'cookie_id':None,'guest_ai_candidate':ai_candidate,'youtube_strategy':strategy}
+        if subtitle_opts['subtitle_output_mode']!='original':
+            if not policy.get('allow_subtitle_translation',True):
+                guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
+            if duration>policy['subtitle_translation_max_duration_minutes']*60:
+                guest_error('guest_translation_duration_limit',f'该视频超过游客字幕翻译时长限制（{int(policy["subtitle_translation_max_duration_minutes"])} 分钟）')
+        options={'mode':'subtitles','cookie_id':None,'guest_ai_candidate':ai_candidate,'youtube_strategy':strategy,**subtitle_opts}
     return options
 def admit_guest_disk(policy):
     free=shutil.disk_usage(ROOT).free
@@ -812,7 +884,12 @@ async def probe(b:Probe):
 @app.post('/api/admin/tasks',dependencies=[Depends(auth)])
 @app.post('/api/tasks',dependencies=[Depends(auth)])
 async def create(b:Task):
-    u=await validate(b.url);return insert_task(u,b.title,b.platform,b.options,'admin','admin')
+    u=await validate(b.url)
+    options=b.options if isinstance(b.options,dict) else {}
+    if str(options.get('mode') or '')=='subtitles':
+        options={**options,**subtitle_options_from_payload(options,guest=False)}
+        options['cookie_id']=options.get('cookie_id')
+    return insert_task(u,b.title,b.platform,options,'admin','admin')
 @app.get('/api/admin/tasks',dependencies=[Depends(auth)])
 @app.get('/api/tasks',dependencies=[Depends(auth)])
 def tasks(include_koofr:bool=False):
@@ -844,6 +921,10 @@ def guest_health(identity:dict=Depends(guest_identity)):
             'max_video_duration_minutes':policy['max_video_duration_minutes'],
             'allow_ai_transcription':policy['allow_ai_transcription'],
             'ai_transcription_max_duration_minutes':policy['ai_transcription_max_duration_minutes'],
+            'allow_subtitle_translation':policy['allow_subtitle_translation'],
+            'subtitle_translation_max_duration_minutes':policy['subtitle_translation_max_duration_minutes'],
+            'subtitle_translation_hourly_limit_per_guest':policy['subtitle_translation_hourly_limit_per_guest'],
+            'supported_subtitle_languages':dict(SUBTITLE_LANGUAGES),
         },
     }
 @app.post('/api/guest/probe')
