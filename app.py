@@ -45,19 +45,27 @@ def bootstrap_admin_password():
         setmeta('password',hpw(env));return
     setmeta('password',hpw('admin'))
 def recover_interrupted_tasks():
-    with con() as c:rows=[dict(item) for item in c.execute("SELECT id FROM tasks WHERE status IN ('downloading','processing')")]
-    if not rows:return
-    stamp=now()
-    with con() as c:
-        c.execute("UPDATE tasks SET status='queued',error_code=NULL,error_message=NULL,speed='',eta='',progress=0,updated=? WHERE status IN ('downloading','processing')",(stamp,))
+    with con() as c:rows=[dict(item) for item in c.execute("SELECT id,owner_type,status FROM tasks WHERE status IN ('downloading','processing')")]
     for item in rows:
-        task_id=str(item['id'])
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',task_id):continue
-        work=TMP/task_id
+        task_id=str(item.get('id') or '')
+        owner_type=str(item.get('owner_type') or 'unknown')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',task_id):
+            print(f'[Recovery] task={task_id or "invalid"} owner={owner_type} error=ValueError: invalid task id',flush=True)
+            continue
         try:
-            if work.is_dir():shutil.rmtree(work)
-        except OSError as exc:
-            print(f'[Recovery] task={task_id} owner=unknown error={type(exc).__name__}: {str(exc)[:200]}',flush=True)
+            for directory in (TMP/task_id,DL/task_id):
+                if directory.exists():shutil.rmtree(directory)
+            stamp=now()
+            with con() as c:
+                c.execute("UPDATE tasks SET status='queued',progress=0,speed='',eta='',error_code=NULL,error_message=NULL,output_path=NULL,output_size=NULL,finished=NULL,log_tail='',updated=? WHERE id=? AND status IN ('downloading','processing')",(stamp,task_id))
+        except Exception as exc:
+            message='中断任务清理失败，请管理员重试'
+            print(f'[Recovery] task={task_id} owner={owner_type} error={type(exc).__name__}: {str(exc)[:200]}',flush=True)
+            try:
+                with con() as c:
+                    c.execute("UPDATE tasks SET status='failed',error_code=?,error_message=?,speed='',eta='',progress=0,updated=?,finished=? WHERE id=? AND status IN ('downloading','processing')",('RECOVERY_CLEANUP_FAILED',message,now(),now(),task_id))
+            except Exception as mark_exc:
+                print(f'[Recovery] task={task_id} owner={owner_type} error={type(mark_exc).__name__}: {str(mark_exc)[:200]}',flush=True)
 def meta(k):
     with con() as c:r=c.execute('SELECT v FROM meta WHERE k=?',(k,)).fetchone();return r['v'] if r else None
 def setmeta(k,v):
@@ -829,8 +837,9 @@ def guest_delete(i,identity:dict=Depends(guest_identity)):
     return {'ok':True}
 @app.get('/api/guest/tasks/{i}/download')
 def guest_download(i,identity:dict=Depends(guest_identity)):
-    task=guest_task(i,identity);path=Path(task['output_path']).resolve() if task.get('output_path') else None
-    if not path or not path.is_file() or not _inside(DL.resolve(),path):raise HTTPException(404,'文件不存在')
+    task=guest_task(i,identity)
+    if not guest_download_available(task):raise HTTPException(404,'文件不存在')
+    path=Path(task['output_path']).resolve()
     return FileResponse(path,filename=path.name)
 @app.post('/api/admin/tasks/{i}/cancel',dependencies=[Depends(auth)])
 @app.post('/api/tasks/{i}/cancel',dependencies=[Depends(auth)])
