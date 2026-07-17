@@ -49,7 +49,7 @@
     SUBTITLE_SOURCE_QUALITY_FAILED: '平台字幕质量异常，未继续翻译。',
     SUBTITLE_TRANSLATION_QUALITY_FAILED: '翻译质量未达标，已保留原字幕。',
     SUBTITLE_TRANSLATION_STRUCTURE_FAILED: '翻译结果结构异常，已保留原字幕。',
-    SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN: '无法可靠识别源语言，未继续翻译。',
+    SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN: '无法确定源语言，已保留原字幕。',
     SUBTITLE_TRANSLATION_FAILED: '翻译失败，已保留原字幕。',
     PLATFORM_AUTO_TRANSLATED_SUBTITLE_USED: '已使用平台自动翻译字幕，质量可能不稳定。',
   };
