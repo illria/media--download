@@ -143,17 +143,17 @@
           <div class="card">
             <h2>系统设置</h2>
             <form id="settingsForm" class="grid-2">
-              <div class="field"><label for="maxFile">最大文件 GB</label><input id="maxFile" type="number" step="0.1" min="0.1"></div>
-              <div class="field"><label for="maxRes">最高分辨率</label><input id="maxRes" type="number" min="144"></div>
-              <div class="field"><label for="retention">保留小时</label><input id="retention" type="number" min="1"></div>
-              <div class="field"><label for="minFree">最低剩余空间 GB</label><input id="minFree" type="number" step="0.1" min="0.1"></div>
-              <div class="field"><label for="sleep">请求间隔秒</label><input id="sleep" type="number" step="0.1" min="0"></div>
+              <div class="field"><label for="maxFile">最大文件 GB</label><input id="maxFile" type="number" step="0.1" min="0.1" required></div>
+              <div class="field"><label for="maxRes">最高分辨率</label><input id="maxRes" type="number" min="144" required></div>
+              <div class="field"><label for="retention">保留小时</label><input id="retention" type="number" min="1" required></div>
+              <div class="field"><label for="minFree">最低剩余空间 GB</label><input id="minFree" type="number" step="0.1" min="0.1" required></div>
+              <div class="field"><label for="sleep">请求间隔秒</label><input id="sleep" type="number" step="0.1" min="0" required></div>
               <div class="field"><label for="proxy">代理</label><input id="proxy" type="text" autocomplete="off" placeholder="留空保持现有代理"></div>
+              <div class="row" style="grid-column:1 / -1;margin-top:4px">
+                <button id="saveSettingsBtn" class="btn btn-primary" type="submit">保存系统设置</button>
+                <button id="clearProxyBtn" class="btn btn-danger" type="button">清除代理</button>
+              </div>
             </form>
-            <div class="row" style="margin-top:8px">
-              <button id="saveSettingsBtn" class="btn btn-primary" type="button">保存系统设置</button>
-              <button id="clearProxyBtn" class="btn btn-danger" type="button">清除代理</button>
-            </div>
             <p id="settingsMsg" class="live-region muted" aria-live="polite"></p>
           </div>
           <div class="card">
@@ -174,36 +174,38 @@
         <section id="page-guest-policy" class="section">
           <div class="card">
             <h2>游客策略</h2>
-            <p class="muted">仅提交 guest_policy，不会覆盖其他系统设置。带“安全保护项”标签的开关默认关闭。</p>
+            <p class="muted">仅提交 guest_policy，不会覆盖其他系统设置。Cookie / Koofr / 直播当前版本固定关闭。</p>
             <form id="guestPolicyForm" class="grid-2">
-              <div class="field"><label for="gp_max_file_size_gb">单文件最大 GB</label><input id="gp_max_file_size_gb" type="number" step="0.1"></div>
-              <div class="field"><label for="gp_default_resolution">默认分辨率</label><input id="gp_default_resolution" type="number"></div>
-              <div class="field"><label for="gp_max_resolution">最高分辨率</label><input id="gp_max_resolution" type="number"></div>
-              <div class="field"><label for="gp_retention_minutes">保留分钟</label><input id="gp_retention_minutes" type="number"></div>
-              <div class="field"><label for="gp_min_free_gb">最低剩余空间 GB</label><input id="gp_min_free_gb" type="number" step="0.1"></div>
-              <div class="field"><label for="gp_emergency_free_gb">紧急保护线 GB</label><input id="gp_emergency_free_gb" type="number" step="0.1"></div>
-              <div class="field"><label for="gp_request_sleep_seconds">请求间隔秒</label><input id="gp_request_sleep_seconds" type="number" step="0.1"></div>
-              <div class="field"><label for="gp_max_active_tasks_per_guest">每游客活跃任务上限</label><input id="gp_max_active_tasks_per_guest" type="number"></div>
-              <div class="field"><label for="gp_max_queued_tasks_per_guest">每游客排队上限</label><input id="gp_max_queued_tasks_per_guest" type="number"></div>
-              <div class="field"><label for="gp_global_guest_concurrency">全局游客并发</label><input id="gp_global_guest_concurrency" type="number"></div>
-              <div class="field"><label for="gp_max_video_duration_minutes">最长媒体分钟</label><input id="gp_max_video_duration_minutes" type="number"></div>
-              <div class="field"><label for="gp_ai_transcription_max_duration_minutes">AI 字幕最长分钟</label><input id="gp_ai_transcription_max_duration_minutes" type="number"></div>
-              <div class="field"><label for="gp_ai_transcription_global_concurrency">AI 全局并发</label><input id="gp_ai_transcription_global_concurrency" type="number"></div>
-              <div class="field"><label for="gp_ai_transcription_hourly_limit_per_guest">AI 每小时次数</label><input id="gp_ai_transcription_hourly_limit_per_guest" type="number"></div>
+              <div class="field"><label for="gp_max_file_size_gb">单文件最大 GB</label><input id="gp_max_file_size_gb" type="number" step="0.1" min="0.1" required></div>
+              <div class="field"><label for="gp_default_resolution">默认分辨率</label><input id="gp_default_resolution" type="number" min="144" required></div>
+              <div class="field"><label for="gp_max_resolution">最高分辨率</label><input id="gp_max_resolution" type="number" min="144" required></div>
+              <div class="field"><label for="gp_retention_minutes">保留分钟</label><input id="gp_retention_minutes" type="number" min="1" required></div>
+              <div class="field"><label for="gp_min_free_gb">最低剩余空间 GB</label><input id="gp_min_free_gb" type="number" step="0.1" min="0.1" required></div>
+              <div class="field"><label for="gp_emergency_free_gb">紧急保护线 GB</label><input id="gp_emergency_free_gb" type="number" step="0.1" min="0.1" required></div>
+              <div class="field"><label for="gp_request_sleep_seconds">请求间隔秒</label><input id="gp_request_sleep_seconds" type="number" step="0.1" min="0" required></div>
+              <div class="field"><label for="gp_max_active_tasks_per_guest">每游客活跃任务上限</label><input id="gp_max_active_tasks_per_guest" type="number" min="1" required></div>
+              <div class="field"><label for="gp_max_queued_tasks_per_guest">每游客排队上限</label><input id="gp_max_queued_tasks_per_guest" type="number" min="1" required></div>
+              <div class="field"><label for="gp_global_guest_concurrency">全局游客并发</label><input id="gp_global_guest_concurrency" type="number" min="1" required></div>
+              <div class="field"><label for="gp_max_video_duration_minutes">最长媒体分钟</label><input id="gp_max_video_duration_minutes" type="number" min="1" required></div>
+              <div class="field"><label for="gp_ai_transcription_max_duration_minutes">AI 字幕最长分钟</label><input id="gp_ai_transcription_max_duration_minutes" type="number" min="1" required></div>
+              <div class="field"><label for="gp_ai_transcription_global_concurrency">AI 全局并发</label><input id="gp_ai_transcription_global_concurrency" type="number" min="1" required></div>
+              <div class="field"><label for="gp_ai_transcription_hourly_limit_per_guest">AI 每小时次数</label><input id="gp_ai_transcription_hourly_limit_per_guest" type="number" min="1" required></div>
               <div class="field"><label for="gp_allow_ai_transcription">允许 AI 字幕</label>
                 <select id="gp_allow_ai_transcription"><option value="true">开启</option><option value="false">关闭</option></select>
               </div>
-              <div class="field"><label for="gp_allow_cookie">允许 Cookie <span class="tag protect">安全保护项</span></label>
-                <select id="gp_allow_cookie"><option value="false">关闭</option><option value="true">开启</option></select>
+              <div class="field"><label for="gp_allow_cookie">允许 Cookie <span class="tag protect">当前版本固定关闭</span></label>
+                <select id="gp_allow_cookie" disabled><option value="false" selected>关闭</option></select>
               </div>
-              <div class="field"><label for="gp_allow_koofr">允许 Koofr <span class="tag protect">安全保护项</span></label>
-                <select id="gp_allow_koofr"><option value="false">关闭</option><option value="true">开启</option></select>
+              <div class="field"><label for="gp_allow_koofr">允许 Koofr <span class="tag protect">当前版本固定关闭</span></label>
+                <select id="gp_allow_koofr" disabled><option value="false" selected>关闭</option></select>
               </div>
-              <div class="field"><label for="gp_allow_live_download">允许直播 <span class="tag protect">安全保护项</span></label>
-                <select id="gp_allow_live_download"><option value="false">关闭</option><option value="true">开启</option></select>
+              <div class="field"><label for="gp_allow_live_download">允许直播 <span class="tag protect">当前版本固定关闭</span></label>
+                <select id="gp_allow_live_download" disabled><option value="false" selected>关闭</option></select>
+              </div>
+              <div style="grid-column:1 / -1">
+                <button id="saveGuestPolicyBtn" class="btn btn-primary" type="submit">保存游客策略</button>
               </div>
             </form>
-            <button id="saveGuestPolicyBtn" class="btn btn-primary" type="button">保存游客策略</button>
             <p id="guestPolicyMsg" class="live-region muted" aria-live="polite"></p>
           </div>
         </section>

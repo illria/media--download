@@ -300,20 +300,47 @@
     if (!state.probe) return;
     const status = document.getElementById('adminCreateStatus');
     const selected = state.selectedVideo;
+    const cookieId = document.getElementById('probeCookie').value || null;
     const options = {
       mode,
-      engine: mode === 'live' ? 'streamlink' : 'auto',
-      resolution: Number((selected && selected.height) || 1080),
-      format_id: selected && selected.format_id ? String(selected.format_id) : null,
-      format_has_audio: !!(selected && selected.has_audio),
-      audio_format: mode === 'audio' ? 'mp3' : 'original',
       write_thumbnail: false,
       embed_metadata: true,
-      cookie_id: document.getElementById('probeCookie').value || null,
-      subtitle_languages: ['zh-CN', 'zh', 'en'],
-      stream_quality: 'best',
+      cookie_id: cookieId,
       youtube_strategy: state.probe.download_strategy || null,
     };
+    if (mode === 'video') {
+      options.engine = 'auto';
+      options.resolution = Number((selected && selected.height) || 1080);
+      options.format_id = selected && selected.format_id ? String(selected.format_id) : null;
+      options.format_has_audio = !!(selected && selected.has_audio);
+      options.audio_format = 'original';
+    } else if (mode === 'audio') {
+      options.engine = 'auto';
+      options.format_id = null;
+      options.format_has_audio = false;
+      options.audio_format = 'mp3';
+    } else if (mode === 'thumbnail') {
+      options.engine = 'auto';
+      options.format_id = null;
+      options.format_has_audio = false;
+      options.audio_format = 'original';
+    } else if (mode === 'subtitles') {
+      options.engine = 'auto';
+      options.format_id = null;
+      options.format_has_audio = false;
+      options.audio_format = 'original';
+      options.subtitle_languages = ['zh-CN', 'zh', 'en'];
+    } else if (mode === 'live') {
+      options.engine = 'streamlink';
+      options.format_id = null;
+      options.format_has_audio = false;
+      options.audio_format = 'original';
+      options.stream_quality = 'best';
+    } else {
+      status.textContent = '不支持的下载类型';
+      status.className = 'live-region error';
+      return;
+    }
     status.textContent = '正在创建任务…';
     status.className = 'live-region muted';
     try {
@@ -383,7 +410,9 @@
       }
       parts.push(`<button type="button" class="btn btn-ghost btn-quiet" data-task-action="koofr-download" data-id="${id}">从 Koofr 下载</button>`);
     }
-    parts.push(`<button type="button" class="btn btn-ghost btn-quiet" data-task-action="delete" data-id="${id}">删除</button>`);
+    if (['completed', 'failed', 'cancelled', 'expired'].includes(task.status)) {
+      parts.push(`<button type="button" class="btn btn-ghost btn-quiet" data-task-action="delete" data-id="${id}">删除</button>`);
+    }
     return parts.join('');
   }
 
@@ -411,7 +440,7 @@
           <span>${escapeHtml(formatSize(task.output_size))}</span>
           <span>${progress.toFixed(1)}%</span>
         </div>
-        <div class="progress" aria-hidden="true"><span style="width:${progress}%;display:block;height:100%;background:linear-gradient(90deg,var(--gemini-blue),var(--gemini-cyan))"></span></div>
+        <div class="progress-bar" aria-hidden="true"><span style="width:${progress}%"></span></div>
         <div class="row muted">
           <span>创建：${escapeHtml(formatTime(task.created))}</span>
           <span>完成：${escapeHtml(formatTime(task.finished))}</span>
@@ -439,6 +468,44 @@
     }
   }
 
+  function filenameFromDisposition(header, fallback) {
+    if (!header) return fallback;
+    const utf8 = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header);
+    if (utf8) {
+      try { return decodeURIComponent(utf8[1].trim().replace(/^"|"$/g, '')); } catch { /* ignore */ }
+    }
+    const plain = /filename\s*=\s*("?)([^";]+)\1/i.exec(header);
+    if (plain) return plain[2].trim();
+    return fallback;
+  }
+
+  async function downloadAuthorized(path, fallbackName) {
+    const response = await fetch(path, {
+      headers: { Authorization: `Bearer ${state.token}` },
+    });
+    if (response.status === 401) {
+      clearSession('登录已失效，请重新登录');
+      throw new Error('登录已失效');
+    }
+    if (!response.ok) {
+      let data = null;
+      try { data = await response.json(); } catch { data = null; }
+      throw new Error(detailMessage(data, '下载失败'));
+    }
+    const filename = filenameFromDisposition(response.headers.get('Content-Disposition'), fallbackName);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename || fallbackName;
+    link.rel = 'noopener';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+  }
+
   async function handleTaskAction(action, id, button) {
     try {
       if (action === 'cancel') await adminApi(`/api/admin/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
@@ -447,18 +514,7 @@
         if (!confirm('确定删除该任务？')) return;
         await adminApi(`/api/admin/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
       } else if (action === 'download') {
-        const response = await fetch(`/api/admin/tasks/${encodeURIComponent(id)}/download`, {
-          headers: { Authorization: `Bearer ${state.token}` },
-        });
-        if (response.status === 401) return clearSession('登录已失效，请重新登录');
-        if (!response.ok) throw new Error('下载失败');
-        const blob = await response.blob();
-        const link = document.createElement('a');
-        const objectUrl = URL.createObjectURL(blob);
-        link.href = objectUrl;
-        link.download = 'media';
-        link.click();
-        URL.revokeObjectURL(objectUrl);
+        await downloadAuthorized(`/api/admin/tasks/${encodeURIComponent(id)}/download`, 'download.bin');
         return;
       } else if (action === 'koofr-status') {
         if (button) button.disabled = true;
@@ -472,18 +528,7 @@
         renderTasks();
         return;
       } else if (action === 'koofr-download') {
-        const response = await fetch(`/api/admin/tasks/${encodeURIComponent(id)}/koofr-download`, {
-          headers: { Authorization: `Bearer ${state.token}` },
-        });
-        if (response.status === 401) return clearSession('登录已失效，请重新登录');
-        if (!response.ok) throw new Error(detailMessage(await response.json().catch(() => null), 'Koofr 下载失败'));
-        const blob = await response.blob();
-        const link = document.createElement('a');
-        const objectUrl = URL.createObjectURL(blob);
-        link.href = objectUrl;
-        link.download = 'koofr-media';
-        link.click();
-        URL.revokeObjectURL(objectUrl);
+        await downloadAuthorized(`/api/admin/tasks/${encodeURIComponent(id)}/koofr-download`, 'koofr-download.zip');
         return;
       }
       await loadTasks(true);
@@ -527,9 +572,6 @@
       ai_transcription_global_concurrency: 'gp_ai_transcription_global_concurrency',
       ai_transcription_hourly_limit_per_guest: 'gp_ai_transcription_hourly_limit_per_guest',
       allow_ai_transcription: 'gp_allow_ai_transcription',
-      allow_cookie: 'gp_allow_cookie',
-      allow_koofr: 'gp_allow_koofr',
-      allow_live_download: 'gp_allow_live_download',
     };
     Object.entries(map).forEach(([key, id]) => {
       const node = document.getElementById(id);
@@ -537,45 +579,73 @@
       if (node.tagName === 'SELECT') node.value = String(!!policy[key]);
       else node.value = policy[key] ?? '';
     });
+    ['gp_allow_cookie', 'gp_allow_koofr', 'gp_allow_live_download'].forEach((id) => {
+      const node = document.getElementById(id);
+      if (node) {
+        node.value = 'false';
+        node.disabled = true;
+      }
+    });
+  }
+
+  function readNumber(id, { min = null, integer = false } = {}) {
+    const raw = document.getElementById(id).value;
+    if (raw === '' || raw == null) throw new Error('请填写所有必填项');
+    const value = Number(raw);
+    if (!Number.isFinite(value) || Number.isNaN(value)) throw new Error('存在无效数字');
+    if (min != null && value < min) throw new Error('存在小于允许范围的数值');
+    return integer ? Math.trunc(value) : value;
   }
 
   function readGuestPolicy() {
-    const bool = (id) => document.getElementById(id).value === 'true';
-    const num = (id) => Number(document.getElementById(id).value);
     return {
-      max_file_size_gb: num('gp_max_file_size_gb'),
-      default_resolution: num('gp_default_resolution'),
-      max_resolution: num('gp_max_resolution'),
-      retention_minutes: num('gp_retention_minutes'),
-      min_free_gb: num('gp_min_free_gb'),
-      emergency_free_gb: num('gp_emergency_free_gb'),
-      request_sleep_seconds: num('gp_request_sleep_seconds'),
-      max_active_tasks_per_guest: num('gp_max_active_tasks_per_guest'),
-      max_queued_tasks_per_guest: num('gp_max_queued_tasks_per_guest'),
-      global_guest_concurrency: num('gp_global_guest_concurrency'),
-      max_video_duration_minutes: num('gp_max_video_duration_minutes'),
-      allow_ai_transcription: bool('gp_allow_ai_transcription'),
-      ai_transcription_max_duration_minutes: num('gp_ai_transcription_max_duration_minutes'),
-      ai_transcription_global_concurrency: num('gp_ai_transcription_global_concurrency'),
-      ai_transcription_hourly_limit_per_guest: num('gp_ai_transcription_hourly_limit_per_guest'),
-      allow_cookie: bool('gp_allow_cookie'),
-      allow_koofr: bool('gp_allow_koofr'),
-      allow_live_download: bool('gp_allow_live_download'),
+      max_file_size_gb: readNumber('gp_max_file_size_gb', { min: 0.1 }),
+      default_resolution: readNumber('gp_default_resolution', { min: 144, integer: true }),
+      max_resolution: readNumber('gp_max_resolution', { min: 144, integer: true }),
+      retention_minutes: readNumber('gp_retention_minutes', { min: 1, integer: true }),
+      min_free_gb: readNumber('gp_min_free_gb', { min: 0.1 }),
+      emergency_free_gb: readNumber('gp_emergency_free_gb', { min: 0.1 }),
+      request_sleep_seconds: readNumber('gp_request_sleep_seconds', { min: 0 }),
+      max_active_tasks_per_guest: readNumber('gp_max_active_tasks_per_guest', { min: 1, integer: true }),
+      max_queued_tasks_per_guest: readNumber('gp_max_queued_tasks_per_guest', { min: 1, integer: true }),
+      global_guest_concurrency: readNumber('gp_global_guest_concurrency', { min: 1, integer: true }),
+      max_video_duration_minutes: readNumber('gp_max_video_duration_minutes', { min: 1, integer: true }),
+      allow_ai_transcription: document.getElementById('gp_allow_ai_transcription').value === 'true',
+      ai_transcription_max_duration_minutes: readNumber('gp_ai_transcription_max_duration_minutes', { min: 1, integer: true }),
+      ai_transcription_global_concurrency: readNumber('gp_ai_transcription_global_concurrency', { min: 1, integer: true }),
+      ai_transcription_hourly_limit_per_guest: readNumber('gp_ai_transcription_hourly_limit_per_guest', { min: 1, integer: true }),
+      allow_cookie: false,
+      allow_koofr: false,
+      allow_live_download: false,
     };
   }
 
-  async function saveSettings() {
+  async function saveSettings(event) {
+    if (event) event.preventDefault();
+    const form = document.getElementById('settingsForm');
     const msg = document.getElementById('settingsMsg');
-    const body = {
-      max_file_size_gb: Number(document.getElementById('maxFile').value),
-      max_resolution: Number(document.getElementById('maxRes').value),
-      retention_hours: Number(document.getElementById('retention').value),
-      min_free_gb: Number(document.getElementById('minFree').value),
-      request_sleep_seconds: Number(document.getElementById('sleep').value),
-    };
+    if (!form.reportValidity()) return;
+    let body;
+    try {
+      body = {
+        max_file_size_gb: readNumber('maxFile', { min: 0.1 }),
+        max_resolution: readNumber('maxRes', { min: 144, integer: true }),
+        retention_hours: readNumber('retention', { min: 1, integer: true }),
+        min_free_gb: readNumber('minFree', { min: 0.1 }),
+        request_sleep_seconds: readNumber('sleep', { min: 0 }),
+      };
+    } catch (error) {
+      msg.textContent = error.message || '设置校验失败';
+      msg.className = 'live-region error';
+      return;
+    }
     const proxyInput = document.getElementById('proxy').value.trim();
-    if (state.clearProxy) body.proxy_url = '';
-    else if (proxyInput) body.proxy_url = proxyInput;
+    if (proxyInput) {
+      body.proxy_url = proxyInput;
+      state.clearProxy = false;
+    } else if (state.clearProxy) {
+      body.proxy_url = '';
+    }
     msg.textContent = '正在保存…';
     msg.className = 'live-region muted';
     try {
@@ -590,14 +660,25 @@
     }
   }
 
-  async function saveGuestPolicy() {
+  async function saveGuestPolicy(event) {
+    if (event) event.preventDefault();
+    const form = document.getElementById('guestPolicyForm');
     const msg = document.getElementById('guestPolicyMsg');
+    if (!form.reportValidity()) return;
+    let policy;
+    try {
+      policy = readGuestPolicy();
+    } catch (error) {
+      msg.textContent = error.message || '游客策略校验失败';
+      msg.className = 'live-region error';
+      return;
+    }
     msg.textContent = '正在保存游客策略…';
     msg.className = 'live-region muted';
     try {
       await adminApi('/api/admin/settings', {
         method: 'PUT',
-        body: { guest_policy: readGuestPolicy() },
+        body: { guest_policy: policy },
       });
       await loadSettings();
       msg.textContent = '游客策略已保存';
@@ -798,7 +879,10 @@
   document.getElementById('refreshKoofrBtn').addEventListener('click', () => loadHealth(true));
   document.getElementById('refreshTasksBtn').addEventListener('click', () => loadTasks(true));
   document.getElementById('adminProbeForm').addEventListener('submit', probeAdmin);
-  document.getElementById('saveSettingsBtn').addEventListener('click', saveSettings);
+  document.getElementById('settingsForm').addEventListener('submit', saveSettings);
+  document.getElementById('proxy').addEventListener('input', () => {
+    if (document.getElementById('proxy').value.trim()) state.clearProxy = false;
+  });
   document.getElementById('clearProxyBtn').addEventListener('click', () => {
     state.clearProxy = true;
     document.getElementById('proxy').value = '';
@@ -806,7 +890,7 @@
     document.getElementById('settingsMsg').textContent = '已标记清除代理，请点击保存';
     document.getElementById('settingsMsg').className = 'live-region warn';
   });
-  document.getElementById('saveGuestPolicyBtn').addEventListener('click', saveGuestPolicy);
+  document.getElementById('guestPolicyForm').addEventListener('submit', saveGuestPolicy);
   document.getElementById('saveAiBtn').addEventListener('click', () => {
     saveAiKey().catch((error) => alert(error.message || '保存失败'));
   });

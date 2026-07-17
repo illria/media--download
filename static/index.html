@@ -48,11 +48,11 @@
         </div>
         <p id="probeStatus" class="live-region muted" aria-live="polite"></p>
       </form>
-      <div class="chips" style="margin-top:14px" aria-label="游客限制说明">
-        <span class="status-chip">单文件最大 1 GB</span>
-        <span class="status-chip">最高 1080p</span>
-        <span class="status-chip">完成后保留 30 分钟</span>
-        <span class="status-chip">AI 字幕最长 20 分钟</span>
+      <div id="guestLimitChips" class="chips" style="margin-top:14px" aria-label="游客限制说明">
+        <span class="status-chip" id="chipFileLimit">单文件最大 1 GB</span>
+        <span class="status-chip" id="chipMaxRes">最高 1080p</span>
+        <span class="status-chip" id="chipRetention">完成后保留 30 分钟</span>
+        <span class="status-chip" id="chipAiLimit">AI 字幕最长 20 分钟</span>
       </div>
     </section>
 

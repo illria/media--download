@@ -1,6 +1,13 @@
 (() => {
-  const GUEST_LIMIT_BYTES = 1024 ** 3;
-  const RETENTION_MS = 30 * 60 * 1000;
+  const DEFAULT_LIMITS = {
+    max_file_size_gb: 1,
+    default_resolution: 720,
+    max_resolution: 1080,
+    retention_minutes: 30,
+    max_video_duration_minutes: 60,
+    allow_ai_transcription: true,
+    ai_transcription_max_duration_minutes: 20,
+  };
   const ERROR_MAP = {
     guest_probe_required: '请先解析链接，再创建下载任务。',
     guest_probe_failed: '游客解析失败，请确认链接为公开可访问的媒体。',
@@ -39,11 +46,13 @@
     selectedVideo: null,
     selectedAudio: null,
     tasks: [],
+    limits: { ...DEFAULT_LIMITS },
     taskTimer: null,
     healthTimer: null,
     countdownTimer: null,
     taskInFlight: false,
     healthInFlight: false,
+    pollKey: '',
   };
 
   const el = {
@@ -63,6 +72,10 @@
     taskList: document.getElementById('taskList'),
     refreshTasksBtn: document.getElementById('refreshTasksBtn'),
     manualRefreshBtn: document.getElementById('manualRefreshBtn'),
+    chipFileLimit: document.getElementById('chipFileLimit'),
+    chipMaxRes: document.getElementById('chipMaxRes'),
+    chipRetention: document.getElementById('chipRetention'),
+    chipAiLimit: document.getElementById('chipAiLimit'),
   };
 
   function text(value) {
@@ -118,6 +131,43 @@
     return fallback;
   }
 
+  function limitBytes() {
+    return Number(state.limits.max_file_size_gb || DEFAULT_LIMITS.max_file_size_gb) * (1024 ** 3);
+  }
+
+  function maxResolution() {
+    return Number(state.limits.max_resolution || DEFAULT_LIMITS.max_resolution);
+  }
+
+  function defaultResolution() {
+    return Number(state.limits.default_resolution || DEFAULT_LIMITS.default_resolution);
+  }
+
+  function applyLimits(limits) {
+    if (!limits || typeof limits !== 'object') return;
+    state.limits = {
+      max_file_size_gb: Number(limits.max_file_size_gb) || DEFAULT_LIMITS.max_file_size_gb,
+      default_resolution: Number(limits.default_resolution) || DEFAULT_LIMITS.default_resolution,
+      max_resolution: Number(limits.max_resolution) || DEFAULT_LIMITS.max_resolution,
+      retention_minutes: Number(limits.retention_minutes) || DEFAULT_LIMITS.retention_minutes,
+      max_video_duration_minutes: Number(limits.max_video_duration_minutes) || DEFAULT_LIMITS.max_video_duration_minutes,
+      allow_ai_transcription: limits.allow_ai_transcription !== false,
+      ai_transcription_max_duration_minutes: Number(limits.ai_transcription_max_duration_minutes) || DEFAULT_LIMITS.ai_transcription_max_duration_minutes,
+    };
+    if (el.chipFileLimit) el.chipFileLimit.textContent = `单文件最大 ${state.limits.max_file_size_gb} GB`;
+    if (el.chipMaxRes) el.chipMaxRes.textContent = `最高 ${state.limits.max_resolution}p`;
+    if (el.chipRetention) el.chipRetention.textContent = `完成后保留 ${state.limits.retention_minutes} 分钟`;
+    if (el.chipAiLimit) {
+      el.chipAiLimit.textContent = state.limits.allow_ai_transcription
+        ? `AI 字幕最长 ${state.limits.ai_transcription_max_duration_minutes} 分钟`
+        : 'AI 字幕未启用';
+    }
+    if (state.probe) {
+      state.selectedVideo = chooseDefaultVideo(state.probe.video_options || []);
+      renderFormats();
+    }
+  }
+
   async function guestApi(path, options = {}) {
     const opts = {
       credentials: 'same-origin',
@@ -150,6 +200,7 @@
     state.healthInFlight = true;
     try {
       const data = await guestApi('/api/guest/health');
+      if (data.limits) applyLimits(data.limits);
       if (data.accepting_guest_tasks) {
         setHealth(true, `服务可用 · 排队 ${Number(data.queue_length || 0)} 个`);
       } else {
@@ -163,34 +214,38 @@
   }
 
   function chooseDefaultVideo(options) {
+    const maxRes = maxResolution();
+    const preferred = defaultResolution();
     const list = (options || [])
-      .filter((item) => Number(item.height || 0) > 0 && Number(item.height || 0) <= 1080)
+      .filter((item) => Number(item.height || 0) > 0 && Number(item.height || 0) <= maxRes)
       .slice()
       .sort((a, b) => Number(b.height || 0) - Number(a.height || 0));
     if (!list.length) return null;
-    const exact = list.find((item) => Number(item.height) === 720);
+    const exact = list.find((item) => Number(item.height) === preferred);
     if (exact) return exact;
-    const below = list.filter((item) => Number(item.height) <= 720);
+    const below = list.filter((item) => Number(item.height) <= preferred);
     return below[0] || list[list.length - 1];
   }
 
   function renderFormats() {
+    const maxRes = maxResolution();
+    const maxBytes = limitBytes();
     const videos = (state.probe.video_options || [])
-      .filter((item) => Number(item.height || 0) <= 1080);
+      .filter((item) => Number(item.height || 0) <= maxRes);
     const audios = state.probe.audio_options || [];
     el.videoFormats.innerHTML = videos.map((item) => {
       const size = Number(item.filesize || 0);
-      const over = size > GUEST_LIMIT_BYTES;
+      const over = size > maxBytes;
       const selected = state.selectedVideo && String(state.selectedVideo.format_id) === String(item.format_id);
       return `<button type="button" class="format-btn${selected ? ' active' : ''}" data-video-format="${escapeHtml(item.format_id)}" ${over ? 'disabled' : ''}>
         ${escapeHtml(item.label || `${item.height}p`)}
         <small>${escapeHtml(item.ext || '')}${item.has_audio ? ' · 含音频' : ' · 无音频'}${size ? ` · ${escapeHtml(formatSize(size))}` : ''}${over ? ' · 预计超过游客限制' : ''}</small>
       </button>`;
-    }).join('') || '<p class="muted">没有可用视频格式，可直接使用默认 720p 创建。</p>';
+    }).join('') || `<p class="muted">没有可用视频格式，可直接使用默认 ${escapeHtml(defaultResolution())}p 创建。</p>`;
 
     el.audioFormats.innerHTML = audios.map((item) => {
       const size = Number(item.filesize || 0);
-      const over = size > GUEST_LIMIT_BYTES;
+      const over = size > maxBytes;
       const selected = state.selectedAudio && String(state.selectedAudio.format_id) === String(item.format_id);
       return `<button type="button" class="format-btn${selected ? ' active' : ''}" data-audio-format="${escapeHtml(item.format_id)}" ${over ? 'disabled' : ''}>
         音频 ${escapeHtml(item.ext || 'm4a')}
@@ -214,11 +269,14 @@
       el.resultThumb.alt = '暂无缩略图';
     }
     const hasSubs = Array.isArray(probe.subtitles) && probe.subtitles.length > 0;
+    const aiNote = state.limits.allow_ai_transcription
+      ? `无（将尝试 AI，最长 ${state.limits.ai_transcription_max_duration_minutes} 分钟）`
+      : '无（当前未启用 AI）';
     el.resultMeta.innerHTML = `
       <div>平台：<strong>${escapeHtml(probe.platform || '-')}</strong></div>
       <div>作者：<strong>${escapeHtml(probe.uploader || '-')}</strong></div>
       <div>时长：<strong>${escapeHtml(formatDuration(probe.duration))}</strong></div>
-      <div>平台字幕：<strong>${hasSubs ? '有' : '无（将尝试 AI）'}</strong></div>
+      <div>平台字幕：<strong>${hasSubs ? '有' : aiNote}</strong></div>
       <div>解析策略：<strong>${escapeHtml(probe.download_strategy_label || probe.download_strategy || '自动')}</strong></div>
     `;
     renderFormats();
@@ -262,7 +320,7 @@
     const options = { mode };
     if (mode === 'video') {
       const selected = state.selectedVideo;
-      options.resolution = Number((selected && selected.height) || 720);
+      options.resolution = Number((selected && selected.height) || defaultResolution());
       if (selected && selected.format_id) {
         options.format_id = String(selected.format_id);
         options.format_has_audio = !!selected.has_audio;
@@ -287,7 +345,6 @@
       el.createStatus.textContent = '任务已创建。';
       el.createStatus.className = 'live-region good';
       await loadTasks(true);
-      schedulePolling();
     } catch (error) {
       el.createStatus.textContent = error.message || '创建任务失败';
       el.createStatus.className = 'live-region error';
@@ -295,12 +352,12 @@
   }
 
   function countdownText(task) {
-    if (task.status !== 'completed' || !task.finished) {
-      return task.status === 'completed' ? '文件会按游客保留策略自动清理' : '';
-    }
-    const finished = new Date(task.finished).getTime();
-    if (Number.isNaN(finished)) return '文件会按游客保留策略自动清理';
-    const remain = finished + RETENTION_MS - Date.now();
+    if (task.status !== 'completed') return '';
+    const expiresAt = task.expires_at || null;
+    if (!expiresAt) return '文件会按游客保留策略自动清理';
+    const expires = new Date(expiresAt).getTime();
+    if (Number.isNaN(expires)) return '文件会按游客保留策略自动清理';
+    const remain = expires - Date.now();
     if (remain <= 0) return '文件即将清理或已过期';
     const mins = Math.max(1, Math.ceil(remain / 60000));
     return `文件将在 ${mins} 分钟后自动清理`;
@@ -374,19 +431,6 @@
     }).join('');
   }
 
-  async function loadTasks(force = false) {
-    if (state.taskInFlight && !force) return;
-    state.taskInFlight = true;
-    try {
-      state.tasks = await guestApi('/api/guest/tasks') || [];
-      renderTasks();
-    } catch (error) {
-      el.taskList.innerHTML = `<p class="error">${escapeHtml(error.message || '无法加载任务')}</p>`;
-    } finally {
-      state.taskInFlight = false;
-    }
-  }
-
   function hasActiveTasks() {
     return state.tasks.some((task) => ['queued', 'downloading', 'processing'].includes(task.status));
   }
@@ -398,43 +442,61 @@
     state.taskTimer = null;
     state.healthTimer = null;
     state.countdownTimer = null;
+    state.pollKey = '';
   }
 
-  function schedulePolling() {
-    clearTimers();
+  function pollProfile() {
     const visible = document.visibilityState === 'visible';
     const active = hasActiveTasks();
-    const taskMs = !visible ? 60000 : (active ? 5000 : 15000);
-    const healthMs = !visible ? 120000 : (active ? 30000 : 60000);
-    state.taskTimer = setInterval(() => { loadTasks(false); }, taskMs);
-    state.healthTimer = setInterval(() => { loadHealth(); }, healthMs);
+    return {
+      key: `${visible ? 'vis' : 'hid'}:${active ? 'active' : 'idle'}`,
+      taskMs: !visible ? 60000 : (active ? 5000 : 15000),
+      healthMs: !visible ? 120000 : (active ? 30000 : 60000),
+    };
+  }
+
+  function schedulePolling(force = false) {
+    const profile = pollProfile();
+    if (!force && profile.key === state.pollKey && state.taskTimer && state.healthTimer) return;
+    if (state.taskTimer) clearInterval(state.taskTimer);
+    if (state.healthTimer) clearInterval(state.healthTimer);
+    if (state.countdownTimer) clearInterval(state.countdownTimer);
+    state.pollKey = profile.key;
+    state.taskTimer = setInterval(() => { loadTasks(false); }, profile.taskMs);
+    state.healthTimer = setInterval(() => { loadHealth(); }, profile.healthMs);
     state.countdownTimer = setInterval(() => {
       if (state.tasks.some((task) => task.status === 'completed')) renderTasks();
     }, 30000);
   }
 
-  async function downloadTask(id) {
+  async function loadTasks(force = false) {
+    if (state.taskInFlight && !force) return;
+    state.taskInFlight = true;
     try {
-      const response = await fetch(`/api/guest/tasks/${encodeURIComponent(id)}/download`, {
-        credentials: 'same-origin',
-      });
-      if (!response.ok) throw new Error('文件不存在或尚未完成');
-      const blob = await response.blob();
-      const link = document.createElement('a');
-      const objectUrl = URL.createObjectURL(blob);
-      link.href = objectUrl;
-      link.download = 'media';
-      link.click();
-      URL.revokeObjectURL(objectUrl);
+      state.tasks = await guestApi('/api/guest/tasks') || [];
+      renderTasks();
+      schedulePolling(false);
     } catch (error) {
-      alert(error.message || '下载失败');
+      el.taskList.innerHTML = `<p class="error">${escapeHtml(error.message || '无法加载任务')}</p>`;
+    } finally {
+      state.taskInFlight = false;
     }
+  }
+
+  function downloadTask(id) {
+    const link = document.createElement('a');
+    link.href = `/api/guest/tasks/${encodeURIComponent(id)}/download`;
+    link.rel = 'noopener';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   async function handleTaskAction(action, id) {
     try {
       if (action === 'download') {
-        await downloadTask(id);
+        downloadTask(id);
         return;
       }
       if (action === 'delete' && !confirm('确定删除该任务记录？')) return;
@@ -446,7 +508,6 @@
         await guestApi(`/api/guest/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
       }
       await loadTasks(true);
-      schedulePolling();
     } catch (error) {
       alert(error.message || '操作失败');
     }
@@ -495,7 +556,7 @@
   el.manualRefreshBtn.addEventListener('click', () => { loadTasks(true); loadHealth(); });
 
   document.addEventListener('visibilitychange', () => {
-    schedulePolling();
+    schedulePolling(true);
     if (document.visibilityState === 'visible') {
       loadTasks(true);
       loadHealth();
@@ -504,6 +565,7 @@
 
   window.addEventListener('beforeunload', clearTimers);
 
+  applyLimits(DEFAULT_LIMITS);
   loadHealth();
-  loadTasks(true).then(schedulePolling);
+  loadTasks(true).then(() => schedulePolling(true));
 })();

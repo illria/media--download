@@ -257,6 +257,14 @@ def guest_task(i,identity):
     task=row(i)
     if not task or task.get('owner_type')!='guest' or not hmac.compare_digest(str(task.get('owner_id') or ''),str(identity['owner_id'])):raise HTTPException(404,'任务不存在')
     return task
+def guest_task_expires_at(task):
+    if not task or task.get('status')!='completed' or not task.get('finished'):return None
+    try:
+        finished=datetime.fromisoformat(task['finished'])
+        if finished.tzinfo is None:finished=finished.replace(tzinfo=timezone.utc)
+        expires=finished+timedelta(minutes=int(task_policy(task)['retention_minutes']))
+        return expires.isoformat()
+    except (TypeError,ValueError,OSError):return None
 def guest_task_view(task):
     options=task.get('options') if isinstance(task.get('options'),dict) else {}
     return {
@@ -273,6 +281,7 @@ def guest_task_view(task):
         'created':task.get('created'),
         'updated':task.get('updated'),
         'finished':task.get('finished'),
+        'expires_at':guest_task_expires_at(task),
         'mode':options.get('mode'),
         'resolution':options.get('resolution'),
         'download_available':guest_download_available(task),
@@ -793,7 +802,20 @@ def admin_task(i):
 def guest_health(identity:dict=Depends(guest_identity)):
     policy=guest_policy();free=shutil.disk_usage(ROOT).free
     with con() as c:queued=int(c.execute("SELECT COUNT(*) AS n FROM tasks WHERE owner_type='guest' AND status='queued'").fetchone()['n'])
-    return {'ok':True,'accepting_guest_tasks':free>=int(policy['min_free_gb'])*1024**3 and guest_active_count()<policy['global_guest_concurrency'],'queue_length':queued}
+    return {
+        'ok':True,
+        'accepting_guest_tasks':free>=int(policy['min_free_gb'])*1024**3 and guest_active_count()<policy['global_guest_concurrency'],
+        'queue_length':queued,
+        'limits':{
+            'max_file_size_gb':policy['max_file_size_gb'],
+            'default_resolution':policy['default_resolution'],
+            'max_resolution':policy['max_resolution'],
+            'retention_minutes':policy['retention_minutes'],
+            'max_video_duration_minutes':policy['max_video_duration_minutes'],
+            'allow_ai_transcription':policy['allow_ai_transcription'],
+            'ai_transcription_max_duration_minutes':policy['ai_transcription_max_duration_minutes'],
+        },
+    }
 @app.post('/api/guest/probe')
 async def guest_probe(b:Probe,identity:dict=Depends(guest_identity)):
     u=await validate(b.url);policy=guest_policy()
@@ -859,7 +881,9 @@ def retry(i):
 @app.delete('/api/admin/tasks/{i}',dependencies=[Depends(auth)])
 @app.delete('/api/tasks/{i}',dependencies=[Depends(auth)])
 def delete(i):
-    if not row(i):raise HTTPException(404,'任务不存在')
+    task=row(i)
+    if not task:raise HTTPException(404,'任务不存在')
+    if task.get('status') in {'queued','downloading','processing'}:raise HTTPException(409,'请先取消任务')
     shutil.rmtree(DL/i,ignore_errors=True);shutil.rmtree(TMP/i,ignore_errors=True)
     with con() as c:c.execute('DELETE FROM tasks WHERE id=?',(i,))
     return {'ok':True}
