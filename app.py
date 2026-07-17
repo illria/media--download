@@ -137,7 +137,7 @@ def normalize_subtitle_language(value,allow_auto=False,default='zh-CN'):
 def normalize_subtitle_output_mode(value,default='translated'):
     mode=str(value or default).strip().lower()
     return mode if mode in SUBTITLE_OUTPUT_MODES else default
-def subtitle_options_from_payload(incoming,policy=None,guest=False):
+def subtitle_options_from_payload(incoming,policy=None,guest=False,probed=None):
     policy=policy or guest_policy()
     source=normalize_subtitle_language(incoming.get('subtitle_source_language'),allow_auto=True,default='auto')
     target=normalize_subtitle_language(incoming.get('subtitle_target_language'),allow_auto=False,default='zh-CN')
@@ -146,12 +146,17 @@ def subtitle_options_from_payload(incoming,policy=None,guest=False):
         guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
     if output_mode=='original':
         target=target if target in SUBTITLE_LANGUAGES else 'zh-CN'
-    return {
+    options={
         'subtitle_source_language':source,
         'subtitle_target_language':target,
         'subtitle_output_mode':output_mode,
         'subtitle_languages':[source] if source!='auto' else [target,'en','zh-CN','zh','ja','ko'],
     }
+    if isinstance(probed,dict):
+        try:duration=int(probed.get('duration') or 0)
+        except (TypeError,ValueError):duration=0
+        if duration>0:options['media_duration_seconds']=duration
+    return options
 def is_guest_task(task):return bool(task and task.get('owner_type')=='guest')
 def task_policy(task):
     if not is_guest_task(task):return settings()
@@ -825,18 +830,22 @@ def guest_task_options(payload,probed,policy):
         audio_format=str(incoming.get('audio_format') or 'original');options={'mode':'audio','format_id':str(selected.get('format_id')) if selected else None,'audio_format':audio_format if audio_format in {'original','mp3','m4a','opus','wav','flac'} else 'original','write_thumbnail':False,'embed_metadata':True,'cookie_id':None,'youtube_strategy':strategy}
     elif mode=='thumbnail':options={'mode':'thumbnail','cookie_id':None,'youtube_strategy':strategy}
     else:
-        subtitle_opts=subtitle_options_from_payload(incoming,policy,guest=True)
+        subtitle_opts=subtitle_options_from_payload(incoming,policy,guest=True,probed=probed)
         ai_candidate=not bool(probed.get('subtitles'))
         if ai_candidate:
             if not policy['allow_ai_transcription']:
                 guest_error('guest_ai_disabled','当前未启用游客 AI 字幕')
             if duration>policy['ai_transcription_max_duration_minutes']*60:
                 guest_error('guest_ai_duration_limit_exceeded',f'无平台字幕时，游客 AI 字幕最长支持 {int(policy["ai_transcription_max_duration_minutes"])} 分钟')
-        if subtitle_opts['subtitle_output_mode']!='original':
-            if not policy.get('allow_subtitle_translation',True):
-                guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
-            if duration>policy['subtitle_translation_max_duration_minutes']*60:
-                guest_error('guest_translation_duration_limit',f'该视频超过游客字幕翻译时长限制（{int(policy["subtitle_translation_max_duration_minutes"])} 分钟）')
+        source=subtitle_opts['subtitle_source_language']
+        target=subtitle_opts['subtitle_target_language']
+        output_mode=subtitle_opts['subtitle_output_mode']
+        platform_langs={str(item) for item in (probed.get('subtitles') or [])}
+        same_language=source!='auto' and source==target
+        has_target_language=any(item==target or item.lower().startswith(target.lower()) for item in platform_langs)
+        likely_needs_translation=output_mode in {'translated','bilingual'} and not same_language and not (output_mode=='translated' and has_target_language)
+        if likely_needs_translation and not policy.get('allow_subtitle_translation',True):
+            guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
         options={'mode':'subtitles','cookie_id':None,'guest_ai_candidate':ai_candidate,'youtube_strategy':strategy,**subtitle_opts}
     return options
 def admit_guest_disk(policy):
@@ -887,8 +896,12 @@ async def create(b:Task):
     u=await validate(b.url)
     options=b.options if isinstance(b.options,dict) else {}
     if str(options.get('mode') or '')=='subtitles':
+        # New admin subtitle tasks always write explicit fields; default remains translated.
         options={**options,**subtitle_options_from_payload(options,guest=False)}
         options['cookie_id']=options.get('cookie_id')
+        if options.get('media_duration_seconds') is None:
+            # Admin path has no probe cache here; keep client-provided duration only if already server-validated elsewhere.
+            options.pop('media_duration_seconds', None)
     return insert_task(u,b.title,b.platform,options,'admin','admin')
 @app.get('/api/admin/tasks',dependencies=[Depends(auth)])
 @app.get('/api/tasks',dependencies=[Depends(auth)])

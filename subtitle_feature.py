@@ -74,15 +74,19 @@ def install(core: Any) -> None:
         model = str(data.get("translation_model") or DEFAULT_TRANSLATION_MODEL)
         if model not in ALLOWED_TRANSLATION_MODELS:
             model = DEFAULT_TRANSLATION_MODEL
+        if "translation_fallback_models" in data:
+            source_items = data.get("translation_fallback_models")
+            if not isinstance(source_items, list):
+                source_items = []
+        else:
+            source_items = list(DEFAULT_FALLBACK_MODELS)
         fallbacks = []
-        for item in data.get("translation_fallback_models") or DEFAULT_FALLBACK_MODELS:
-            name = str(item)
+        for item in source_items:
+            name = str(item or "").strip()
             if name in ALLOWED_TRANSLATION_MODELS and name != model and name not in fallbacks:
                 fallbacks.append(name)
             if len(fallbacks) >= 3:
                 break
-        if not fallbacks:
-            fallbacks = [item for item in DEFAULT_FALLBACK_MODELS if item != model][:3]
         return {
             "translation_enabled": bool(data.get("translation_enabled", True)),
             "translation_model": model,
@@ -99,7 +103,9 @@ def install(core: Any) -> None:
                 raise ValueError("翻译主模型不在白名单内")
             current["translation_model"] = model
         if "translation_fallback_models" in payload:
-            items = payload.get("translation_fallback_models") or []
+            items = payload.get("translation_fallback_models")
+            if items is None:
+                items = []
             if not isinstance(items, list):
                 raise ValueError("备用模型格式不正确")
             cleaned = []
@@ -212,11 +218,17 @@ def install(core: Any) -> None:
 
     def task_subtitle_options(task: dict[str, Any]) -> dict[str, str]:
         options = task.get("options") if isinstance(task.get("options"), dict) else {}
+        has_new_fields = any(key in options for key in (
+            "subtitle_output_mode", "subtitle_source_language", "subtitle_target_language",
+        ))
         source = str(options.get("subtitle_source_language") or "auto")
         target = normalize_lang(options.get("subtitle_target_language") or "zh-CN") or "zh-CN"
-        mode = str(options.get("subtitle_output_mode") or "translated").lower()
+        if has_new_fields:
+            mode = str(options.get("subtitle_output_mode") or "translated").lower()
+        else:
+            mode = "original"
         if mode not in {"original", "translated", "bilingual"}:
-            mode = "translated"
+            mode = "translated" if has_new_fields else "original"
         if source != "auto":
             source = normalize_lang(source) or "auto"
         return {
@@ -226,23 +238,24 @@ def install(core: Any) -> None:
         }
 
     def language_candidates(source: str, target: str) -> list[str]:
-        order = []
-        for item in [target, source if source != "auto" else "", "en", "zh-CN", "zh", "ja", "ko", "es", "fr", "de", "ru"]:
+        priority = []
+        for item in [target, source if source != "auto" else "", "en", "zh-CN", "zh", "ja", "ko"]:
             code = str(item or "").strip()
-            if code and code not in order:
-                order.append(code)
-        # include common auto-caption variants
-        expanded = []
-        for code in order:
-            expanded.append(code)
-            if "-" not in code:
-                expanded.append(code + ".*")
-        return expanded or ["en", "zh-CN"]
+            if code and code not in priority:
+                priority.append(code)
+        for code in languages:
+            if code not in priority:
+                priority.append(code)
+        expanded: list[str] = []
+        for code in priority:
+            if code not in expanded:
+                expanded.append(code)
+            if code != "auto" and f"{code}.*" not in expanded:
+                expanded.append(f"{code}.*")
+        return expanded or ["en", "zh-CN", "en.*"]
 
-    def detect_subtitle_meta(path: Path) -> dict[str, Any]:
+    def detect_subtitle_meta(path: Path, auto: bool = False) -> dict[str, Any]:
         name = path.name
-        lower = name.lower()
-        auto = ".auto." in lower or lower.endswith(".auto.srt") or re.search(r"\.(auto|automatic)[\.-]", lower) is not None
         lang = "und"
         match = re.search(r"\.([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)(?:\.auto)?\.srt$", name, re.I)
         if match:
@@ -251,7 +264,7 @@ def install(core: Any) -> None:
             match = re.search(r"\[([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)\]", name)
             if match:
                 lang = normalize_lang(match.group(1)) or match.group(1)
-        return {"path": path, "language": lang, "auto": auto, "size": path.stat().st_size if path.is_file() else 0}
+        return {"path": path, "language": lang, "auto": bool(auto), "size": path.stat().st_size if path.is_file() else 0}
 
     def score_subtitle(meta: dict[str, Any], source: str, target: str, prefer_target: bool) -> tuple:
         lang = normalize_lang(meta.get("language"))
@@ -269,20 +282,29 @@ def install(core: Any) -> None:
     def download_platform_subtitles(task: dict[str, Any], work: Path, cookie: Path | None, source: str, target: str) -> list[dict[str, Any]]:
         candidates = language_candidates(source, target)
         sub_langs = ",".join(candidates)
-        command = core.task_base(task, cookie, False) + [
-            "--skip-download", "--write-subs", "--write-auto-subs",
-            "--sub-langs", sub_langs,
-            "--sub-format", "srt/best", "--convert-subs", "srt",
-            "--output", str(work / "%(title).120B.%(language)s.%(ext)s"), task["url"],
-        ]
-        result = run_task(task, work, command, 180)
-        files = [detect_subtitle_meta(path) for path in work.rglob("*.srt") if path.is_file()]
-        if files:
-            return files
-        if result.returncode and core.denied(result.stderr or result.stdout):
-            retry = core.task_base(task, cookie, True) + command[len(core.task_base(task, cookie, False)):]
-            run_task(task, work, retry, 180)
-            files = [detect_subtitle_meta(path) for path in work.rglob("*.srt") if path.is_file()]
+        files: list[dict[str, Any]] = []
+
+        def run_kind(kind: str, write_flag: str, auto: bool) -> None:
+            target_dir = work / kind
+            target_dir.mkdir(parents=True, exist_ok=True)
+            command = core.task_base(task, cookie, False) + [
+                "--skip-download", write_flag,
+                "--sub-langs", sub_langs,
+                "--sub-format", "srt/best", "--convert-subs", "srt",
+                "--output", str(target_dir / "%(title).100B.%(language)s.%(ext)s"), task["url"],
+            ]
+            result = run_task(task, work, command, 180)
+            found = [detect_subtitle_meta(path, auto=auto) for path in target_dir.rglob("*.srt") if path.is_file()]
+            if found:
+                files.extend(found)
+                return
+            if result.returncode and core.denied(result.stderr or result.stdout):
+                retry = core.task_base(task, cookie, True) + command[len(core.task_base(task, cookie, False)):]
+                run_task(task, work, retry, 180)
+                files.extend(detect_subtitle_meta(path, auto=auto) for path in target_dir.rglob("*.srt") if path.is_file())
+
+        run_kind("platform-manual", "--write-subs", False)
+        run_kind("platform-auto", "--write-auto-subs", True)
         return files
 
     def choose_source_subtitle(files: list[dict[str, Any]], source: str, target: str, prefer_target: bool) -> dict[str, Any] | None:
@@ -294,13 +316,16 @@ def install(core: Any) -> None:
     def parse_srt(text: str) -> list[dict[str, str]]:
         blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n").strip())
         cues: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        generated = 0
         for block in blocks:
-            lines = [line for line in block.split("\n") if line.strip() != "" or True]
             lines = block.split("\n")
             if len(lines) < 2:
                 continue
             idx = 0
-            if re.fullmatch(r"\d+", lines[0].strip()):
+            cue_id = None
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", lines[0].strip()) and "-->" not in lines[0]:
+                cue_id = lines[0].strip()
                 idx = 1
             if idx >= len(lines) or "-->" not in lines[idx]:
                 continue
@@ -311,8 +336,14 @@ def install(core: Any) -> None:
             body = "\n".join(lines[idx + 1:]).strip()
             if not body:
                 continue
+            if not cue_id:
+                generated += 1
+                cue_id = str(generated)
+            if cue_id in seen_ids:
+                raise RuntimeError(json.dumps({"code": "SUBTITLE_PARSE_FAILED", "message": "字幕编号重复"}, ensure_ascii=False))
+            seen_ids.add(cue_id)
             cues.append({
-                "id": str(len(cues) + 1),
+                "id": cue_id,
                 "start": match.group(1).strip(),
                 "end": match.group(2).strip(),
                 "text": body,
@@ -323,17 +354,22 @@ def install(core: Any) -> None:
 
     def write_srt(path: Path, cues: list[dict[str, str]], text_key: str = "text") -> None:
         lines: list[str] = []
-        for index, cue in enumerate(cues, 1):
-            lines.extend([str(index), f"{cue['start']} --> {cue['end']}", str(cue.get(text_key) or cue.get("text") or "").strip(), ""])
+        for cue in cues:
+            lines.extend([
+                str(cue.get("id") or ""),
+                f"{cue['start']} --> {cue['end']}",
+                str(cue.get(text_key) or cue.get("text") or "").strip(),
+                "",
+            ])
         path.write_text("\n".join(lines), encoding="utf-8")
 
     def write_bilingual_srt(path: Path, cues: list[dict[str, str]]) -> None:
         lines: list[str] = []
-        for index, cue in enumerate(cues, 1):
+        for cue in cues:
             original = str(cue.get("text") or "").strip()
             translated = str(cue.get("translated") or "").strip()
             body = original if not translated or translated == original else f"{original}\n{translated}"
-            lines.extend([str(index), f"{cue['start']} --> {cue['end']}", body, ""])
+            lines.extend([str(cue.get("id") or ""), f"{cue['start']} --> {cue['end']}", body, ""])
         path.write_text("\n".join(lines), encoding="utf-8")
 
     def batch_cues(cues: list[dict[str, str]]) -> list[list[dict[str, str]]]:
@@ -628,54 +664,76 @@ def install(core: Any) -> None:
         warning = None
         models_used: list[str] = []
         translated_flag = False
-        same_language = source_language in languages and normalize_lang(source_language) == target
-        need_translation = mode in {"translated", "bilingual"} and not same_language
-        if mode == "translated" and normalize_lang(source_language) == target:
-            primary = original
-            need_translation = False
+        same_language = bool(source_language and source_language != "auto" and normalize_lang(source_language) == target)
+        need_translation = mode in {"translated", "bilingual"} and not same_language and not source_type.startswith("platform_target")
+        if need_translation and core.is_guest_task(task):
+            policy = core.task_policy(task)
+            duration_seconds = 0
+            try:
+                duration_seconds = int((task.get("options") or {}).get("media_duration_seconds") or 0)
+            except (TypeError, ValueError):
+                duration_seconds = 0
+            if duration_seconds and duration_seconds > int(policy.get("subtitle_translation_max_duration_minutes", 60)) * 60:
+                raise RuntimeError(json.dumps({
+                    "code": "GUEST_TRANSLATION_DURATION_LIMIT",
+                    "message": f"该视频超过游客字幕翻译时长限制（{int(policy['subtitle_translation_max_duration_minutes'])} 分钟）",
+                }, ensure_ascii=False))
         if need_translation:
-            if not key:
-                raise RuntimeError("SILICONFLOW_KEY_MISSING")
             settings = load_translation_settings()
-            if not settings["translation_enabled"]:
-                raise RuntimeError(json.dumps({"code": "SUBTITLE_TRANSLATION_DISABLED", "message": "字幕翻译未启用"}, ensure_ascii=False))
             translation_slot = False
             try:
-                if core.is_guest_task(task):
-                    policy = core.task_policy(task)
-                    if not policy.get("allow_subtitle_translation", True):
-                        raise RuntimeError(json.dumps({"code": "GUEST_TRANSLATION_DISABLED", "message": "当前未启用游客字幕翻译"}, ensure_ascii=False))
-                    translation_slot = core.start_guest_translation(task)
-                translated_cues, models_used, translated_flag = translate_cues(task, cues, source_language, target, key)
-                translated_path = work / f"{title}.translated.{target}.srt"
-                write_srt(translated_path, [
-                    {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
-                ])
-                files.append(translated_path)
-                primary = translated_path
-                if mode == "bilingual":
-                    bilingual_path = work / f"{title}.bilingual.{source_language or 'und'}-{target}.srt"
-                    write_bilingual_srt(bilingual_path, translated_cues)
-                    files.append(bilingual_path)
-                    primary = bilingual_path
+                if not key or not settings["translation_enabled"]:
+                    warning = {"code": "SUBTITLE_TRANSLATION_FAILED", "message": "翻译失败，已保留原字幕"}
+                    primary = original
+                else:
+                    if core.is_guest_task(task):
+                        policy = core.task_policy(task)
+                        if not policy.get("allow_subtitle_translation", True):
+                            warning = {"code": "SUBTITLE_TRANSLATION_FAILED", "message": "翻译失败，已保留原字幕"}
+                            primary = original
+                        else:
+                            translation_slot = core.start_guest_translation(task)
+                            translated_cues, models_used, translated_flag = translate_cues(task, cues, source_language, target, key)
+                            translated_path = work / f"{title}.translated.{target}.srt"
+                            write_srt(translated_path, [
+                                {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
+                            ])
+                            files.append(translated_path)
+                            primary = translated_path
+                            if mode == "bilingual":
+                                bilingual_path = work / f"{title}.bilingual.{source_language or 'und'}-{target}.srt"
+                                write_bilingual_srt(bilingual_path, translated_cues)
+                                files.append(bilingual_path)
+                                primary = bilingual_path
+                    else:
+                        translated_cues, models_used, translated_flag = translate_cues(task, cues, source_language, target, key)
+                        translated_path = work / f"{title}.translated.{target}.srt"
+                        write_srt(translated_path, [
+                            {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
+                        ])
+                        files.append(translated_path)
+                        primary = translated_path
+                        if mode == "bilingual":
+                            bilingual_path = work / f"{title}.bilingual.{source_language or 'und'}-{target}.srt"
+                            write_bilingual_srt(bilingual_path, translated_cues)
+                            files.append(bilingual_path)
+                            primary = bilingual_path
             except Exception as exc:
                 try:
                     parsed = json.loads(str(exc))
-                    code, message = parsed.get("code") or "SUBTITLE_TRANSLATION_FAILED", parsed.get("message") or "翻译失败，已保留原字幕"
+                    code = parsed.get("code") or "SUBTITLE_TRANSLATION_FAILED"
+                    message = parsed.get("message") or "翻译失败，已保留原字幕"
                 except Exception:
                     code, message = friendly_error(str(exc), task.get("url") or "")
-                    if code not in {
-                        "SUBTITLE_TRANSLATION_FAILED", "SUBTITLE_TRANSLATION_DISABLED",
-                        "GUEST_TRANSLATION_DISABLED", "GUEST_TRANSLATION_HOURLY_LIMIT",
-                        "GUEST_TRANSLATION_BUSY", "GUEST_TRANSLATION_DURATION_LIMIT",
-                        "SILICONFLOW_KEY_MISSING", "SILICONFLOW_TRANSLATION_UNAUTHORIZED",
-                        "SILICONFLOW_TRANSLATION_RATE_LIMITED", "SILICONFLOW_TRANSLATION_TIMEOUT",
-                    }:
+                    if not code.startswith("GUEST_") and not code.startswith("SUBTITLE_") and not code.startswith("SILICONFLOW_"):
                         code, message = "SUBTITLE_TRANSLATION_FAILED", "翻译失败，已保留原字幕"
-                if code in {"GUEST_TRANSLATION_DISABLED", "GUEST_TRANSLATION_HOURLY_LIMIT", "GUEST_TRANSLATION_BUSY", "GUEST_TRANSLATION_DURATION_LIMIT", "SILICONFLOW_KEY_MISSING"}:
+                # Temporary guest limits should remain retryable failures.
+                if code in {"GUEST_TRANSLATION_HOURLY_LIMIT", "GUEST_TRANSLATION_BUSY", "GUEST_TRANSLATION_DURATION_LIMIT"}:
                     raise RuntimeError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
                 warning = {"code": "SUBTITLE_TRANSLATION_FAILED", "message": "翻译失败，已保留原字幕"}
                 primary = original
+                translated_flag = False
+                models_used = []
             finally:
                 if translation_slot:
                     core.release_guest_translation_slot(task["id"])
@@ -691,10 +749,11 @@ def install(core: Any) -> None:
             "translated": translated_flag,
             "source_type": source_type,
             "translation_skipped_same_language": bool(same_language and mode != "original"),
+            "fallback_to_original": bool(warning is not None),
         }
         meta_path = work / f"{title}.translation.json"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        if mode != "original" or translated_flag:
+        if mode != "original" or translated_flag or warning:
             files.append(meta_path)
         return primary, files, warning
 
