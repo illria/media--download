@@ -51,6 +51,7 @@
     SUBTITLE_TRANSLATION_STRUCTURE_FAILED: '翻译结果结构异常，已保留原字幕。',
     SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN: '无法可靠识别源语言，未继续翻译。',
     SUBTITLE_TRANSLATION_FAILED: '翻译失败，已保留原字幕。',
+    PLATFORM_AUTO_TRANSLATED_SUBTITLE_USED: '已使用平台自动翻译字幕，质量可能不稳定。',
   };
   const OUTPUT_LABEL = { original: '仅原字幕', translated: '翻译字幕', bilingual: '双语字幕' };
   const STATUS_LABEL = {

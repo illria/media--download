@@ -145,6 +145,7 @@ def install(core: Any) -> None:
             "guest_translation_busy": ("GUEST_TRANSLATION_BUSY", "字幕翻译正在处理中，请稍后重试。"),
             "guest_translation_duration_limit": ("GUEST_TRANSLATION_DURATION_LIMIT", "该视频超过游客字幕翻译时长限制。"),
             "subtitle_translation_failed": ("SUBTITLE_TRANSLATION_FAILED", "翻译失败，已保留原字幕。"),
+            "platform_auto_translated_subtitle_used": ("PLATFORM_AUTO_TRANSLATED_SUBTITLE_USED", "已使用平台自动翻译字幕，质量可能不稳定。"),
             "subtitle_translation_quality_failed": ("SUBTITLE_TRANSLATION_QUALITY_FAILED", "翻译质量未达标，已保留原字幕。"),
             "subtitle_translation_structure_failed": ("SUBTITLE_TRANSLATION_STRUCTURE_FAILED", "翻译结果结构异常，已保留原字幕。"),
             "subtitle_source_quality_failed": ("SUBTITLE_SOURCE_QUALITY_FAILED", "平台字幕质量异常，未继续翻译。"),
@@ -247,40 +248,87 @@ def install(core: Any) -> None:
         }
 
     def fetch_media_subtitle_catalog(task: dict[str, Any], cookie: Path | None) -> dict[str, Any]:
+        empty = {"media_language": "", "manual": [], "auto": [], "tracks": [], "raw": {}}
         command = core.task_base(task, cookie, False) + ["--dump-single-json", "--skip-download", "--no-warnings", task["url"]]
         try:
             result = run_task(task, core.TMP / task["id"], command, 90)
         except Exception:
-            return {"media_language": "", "manual": [], "auto": [], "raw": {}}
+            return empty
         if result.returncode:
             if core.denied(result.stderr or result.stdout):
                 retry = core.task_base(task, cookie, True) + command[len(core.task_base(task, cookie, False)):]
                 try:
                     result = run_task(task, core.TMP / task["id"], retry, 90)
                 except Exception:
-                    return {"media_language": "", "manual": [], "auto": [], "raw": {}}
+                    return empty
             if result.returncode:
-                return {"media_language": "", "manual": [], "auto": [], "raw": {}}
+                return empty
         try:
             raw = json.loads(result.stdout or "{}")
         except Exception:
-            return {"media_language": "", "manual": [], "auto": [], "raw": {}}
+            return empty
+
+        def parse_tracks(bucket: dict[str, Any] | None, manual: bool) -> list[dict[str, Any]]:
+            tracks: list[dict[str, Any]] = []
+            for code, entries in (bucket or {}).items():
+                raw_code = str(code or "")
+                lowered = raw_code.lower()
+                names: list[str] = []
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if isinstance(entry, dict):
+                            for key in ("name", "ext", "format"):
+                                if entry.get(key):
+                                    names.append(str(entry.get(key)))
+                joined = " ".join(names)
+                is_orig_code = lowered.endswith("-orig") or lowered.endswith(".orig") or "-orig-" in lowered
+                is_orig_name = bool(re.search(r"\boriginal\b|原始|原文", joined, re.I))
+                normalized = normalize_lang(raw_code.replace("-orig", "").replace(".orig", ""))
+                tracks.append({
+                    "normalized_language": normalized if normalized and normalized != "und" else raw_code,
+                    "raw_language_code": raw_code,
+                    "track_name": joined[:200],
+                    "manual": manual,
+                    "original": bool(is_orig_code or is_orig_name),
+                    "auto_translated": (not manual) and not (is_orig_code or is_orig_name),
+                })
+            return tracks
+
+        manual_tracks = parse_tracks(raw.get("subtitles") or {}, True)
+        auto_tracks = parse_tracks(raw.get("automatic_captions") or {}, False)
+        tracks = manual_tracks + auto_tracks
         media_language = normalize_lang(raw.get("language") or raw.get("original_language") or "")
-        manual = sorted({normalize_lang(code) for code in (raw.get("subtitles") or {}) if code})
-        auto = sorted({normalize_lang(code) for code in (raw.get("automatic_captions") or {}) if code})
+        if not media_language or media_language == "und":
+            original_track = next((item for item in tracks if item.get("original")), None)
+            media_language = (original_track or {}).get("normalized_language") or ""
+        if media_language == "und":
+            media_language = ""
+        for item in tracks:
+            lang = item.get("normalized_language") or ""
+            if media_language and lang == media_language:
+                item["original"] = True
+                item["auto_translated"] = False
+            elif not item.get("original") and not item.get("manual") and media_language and lang and lang != media_language:
+                item["auto_translated"] = True
         return {
-            "media_language": media_language if media_language and media_language != "und" else "",
-            "manual": [code for code in manual if code],
-            "auto": [code for code in auto if code],
+            "media_language": media_language,
+            "manual": sorted({item["normalized_language"] for item in manual_tracks if item.get("normalized_language")}),
+            "auto": sorted({item["normalized_language"] for item in auto_tracks if item.get("normalized_language")}),
+            "tracks": tracks,
             "raw": {"id": raw.get("id"), "title": raw.get("title"), "duration": raw.get("duration")},
         }
 
-    def language_candidates(source: str, target: str, media_language: str = "") -> list[str]:
+    def language_candidates(source: str, target: str, media_language: str = "", catalog: dict[str, Any] | None = None) -> list[str]:
         priority = []
+        catalog = catalog or {}
         for item in [media_language, target, source if source != "auto" else "", "en", "zh-CN", "zh", "bn", "ja", "ko"]:
             code = str(item or "").strip()
             if code and code not in priority and code != "auto":
                 priority.append(code)
+        for item in catalog.get("tracks") or []:
+            for code in (str(item.get("raw_language_code") or ""), str(item.get("normalized_language") or "")):
+                if code and code not in priority:
+                    priority.append(code)
         for code in languages:
             if code not in priority:
                 priority.append(code)
@@ -288,29 +336,46 @@ def install(core: Any) -> None:
         for code in priority:
             if code not in expanded:
                 expanded.append(code)
-            if f"{code}.*" not in expanded:
+            if not str(code).endswith(".*") and f"{code}.*" not in expanded:
                 expanded.append(f"{code}.*")
         return expanded or ["en", "zh-CN", "bn", "en.*"]
 
-    def detect_subtitle_meta(path: Path, auto: bool = False, media_language: str = "") -> dict[str, Any]:
+    def detect_subtitle_meta(path: Path, auto: bool = False, media_language: str = "", catalog: dict[str, Any] | None = None) -> dict[str, Any]:
         name = path.name
         lang = "und"
+        raw_code = ""
         match = re.search(r"\.([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)(?:\.auto)?\.srt$", name, re.I)
         if match:
-            lang = normalize_lang(match.group(1)) or match.group(1)
+            raw_code = match.group(1)
+            lang = normalize_lang(raw_code.replace("-orig", "")) or raw_code
         else:
             match = re.search(r"\[([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)\]", name)
             if match:
-                lang = normalize_lang(match.group(1)) or match.group(1)
-        original = bool(media_language and lang == media_language)
-        # Platform auto-translated tracks are usually automatic and not original-language.
-        auto_translated = bool(auto and media_language and lang and lang != media_language)
+                raw_code = match.group(1)
+                lang = normalize_lang(raw_code.replace("-orig", "")) or raw_code
+        original = bool(media_language and lang == media_language) or bool(re.search(r"-orig|\boriginal\b|原始", name, re.I))
+        auto_translated = False
+        for item in (catalog or {}).get("tracks") or []:
+            item_lang = normalize_lang(item.get("normalized_language"))
+            item_raw = str(item.get("raw_language_code") or "")
+            if item_lang == lang or item_raw.lower() == raw_code.lower():
+                original = bool(item.get("original") or original)
+                auto_translated = bool(item.get("auto_translated"))
+                raw_code = item_raw or raw_code
+                break
+        if auto and media_language and lang and lang != media_language and not original:
+            auto_translated = True
+        if not media_language and auto and not original:
+            # Unknown media language: never invent an original track.
+            auto_translated = not bool(re.search(r"-orig|\boriginal\b|原始", name, re.I))
+            original = False
         return {
             "path": path,
             "language": lang,
+            "raw_language_code": raw_code,
             "auto": bool(auto),
-            "original": original,
-            "auto_translated": auto_translated,
+            "original": bool(original),
+            "auto_translated": bool(auto_translated and not original),
             "size": path.stat().st_size if path.is_file() else 0,
         }
 
@@ -412,8 +477,8 @@ def install(core: Any) -> None:
 
         return (quality_rank + translated_penalty, language_priority(lang, source, target, media_language), size_rank)
 
-    def download_platform_subtitles(task: dict[str, Any], work: Path, cookie: Path | None, source: str, target: str, media_language: str = "") -> list[dict[str, Any]]:
-        candidates = language_candidates(source, target, media_language)
+    def download_platform_subtitles(task: dict[str, Any], work: Path, cookie: Path | None, source: str, target: str, media_language: str = "", catalog: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        candidates = language_candidates(source, target, media_language, catalog=catalog)
         sub_langs = ",".join(candidates)
         files: list[dict[str, Any]] = []
 
@@ -427,14 +492,14 @@ def install(core: Any) -> None:
                 "--output", str(target_dir / "%(title).100B.%(language)s.%(ext)s"), task["url"],
             ]
             result = run_task(task, work, command, 180)
-            found = [detect_subtitle_meta(path, auto=auto, media_language=media_language) for path in target_dir.rglob("*.srt") if path.is_file()]
+            found = [detect_subtitle_meta(path, auto=auto, media_language=media_language, catalog=catalog) for path in target_dir.rglob("*.srt") if path.is_file()]
             if found:
                 files.extend(found)
                 return
             if result.returncode and core.denied(result.stderr or result.stdout):
                 retry = core.task_base(task, cookie, True) + command[len(core.task_base(task, cookie, False)):]
                 run_task(task, work, retry, 180)
-                files.extend(detect_subtitle_meta(path, auto=auto, media_language=media_language) for path in target_dir.rglob("*.srt") if path.is_file())
+                files.extend(detect_subtitle_meta(path, auto=auto, media_language=media_language, catalog=catalog) for path in target_dir.rglob("*.srt") if path.is_file())
 
         core.patch(task["id"], status="processing", progress=8, eta="正在检查原始平台字幕")
         run_kind("platform-manual", "--write-subs", False)
@@ -462,25 +527,88 @@ def install(core: Any) -> None:
 
     def text_metrics(text: str) -> dict[str, float]:
         value = text or ""
+        compact = value.strip()
         total = max(len(value), 1)
-        letters = sum(1 for ch in value if ch.isalpha() or ("一" <= ch <= "鿿") or ("ঀ" <= ch <= "৿"))
-        emoji = sum(1 for ch in value if ord(ch) > 0x1F300)
-        punct = sum(1 for ch in value if ch in "。．.!！?？,，;；:：…·-—_~`\"'()[]{}<>/\\")
-        spaces = sum(1 for ch in value if ch.isspace())
-        meaningful = letters
+        letters = 0
+        digits = 0
+        emoji = 0
+        spaces = 0
+        for ch in value:
+            code = ord(ch)
+            if ch.isspace():
+                spaces += 1
+            elif ch.isdigit() or ("０" <= ch <= "９"):
+                digits += 1
+            elif (
+                ch.isalpha()
+                or ("一" <= ch <= "鿿")
+                or ("ঀ" <= ch <= "৿")
+                or ("؀" <= ch <= "ۿ")
+                or ("Ѐ" <= ch <= "ӿ")
+                or ("가" <= ch <= "힣")
+            ):
+                letters += 1
+            elif code > 0x1F300:
+                emoji += 1
+        meaningful = letters + digits
+
+        def meaningful_char(ch: str) -> bool:
+            return (
+                ch.isalnum()
+                or ("一" <= ch <= "鿿")
+                or ("ঀ" <= ch <= "৿")
+                or ("؀" <= ch <= "ۿ")
+                or ("Ѐ" <= ch <= "ӿ")
+                or ("가" <= ch <= "힣")
+            )
+
+        is_punct_only = bool(compact) and all((not meaningful_char(ch)) and ord(ch) <= 0x1F300 for ch in compact)
+        is_emoji_only = bool(compact) and letters == 0 and digits == 0 and any(ord(ch) > 0x1F300 for ch in compact) and all((ord(ch) > 0x1F300 or not meaningful_char(ch)) for ch in compact)
         return {
             "length": float(len(value)),
             "letter_ratio": meaningful / total,
             "emoji_ratio": emoji / total,
-            "punct_ratio": punct / total,
+            "punct_ratio": max(0.0, 1.0 - meaningful / total - spaces / total),
             "space_ratio": spaces / total,
-            "is_emoji_only": bool(value.strip()) and letters == 0 and emoji > 0,
-            "is_punct_only": bool(value.strip()) and letters == 0 and emoji == 0,
-            "is_single_char": len(value.strip()) <= 1,
-            "has_kana": any("぀" <= ch <= "ヿ" for ch in value),
+            "is_emoji_only": is_emoji_only,
+            "is_punct_only": is_punct_only,
+            "is_single_char": len(compact) <= 1,
+            "has_kana": any("ぁ" <= ch <= "ヿ" for ch in value),
             "has_cjk": any("一" <= ch <= "鿿" for ch in value),
-            "has_latin": any("a" <= ch.lower() <= "z" for ch in value if ch.isalpha()),
+            "has_latin": any(("a" <= ch.lower() <= "z") for ch in value if ch.isalpha()),
+            "has_bengali": any("ঀ" <= ch <= "৿" for ch in value),
+            "has_arabic": any("؀" <= ch <= "ۿ" for ch in value),
+            "has_cyrillic": any("Ѐ" <= ch <= "ӿ" for ch in value),
+            "has_hangul": any("가" <= ch <= "힣" for ch in value),
+            "has_digit": digits > 0,
         }
+
+    def script_match_ratio(metrics_list: list[dict[str, float]], expected_language: str) -> float:
+        if not metrics_list:
+            return 0.0
+        lang = (expected_language or "").lower()
+
+        def ok(item: dict[str, float]) -> bool:
+            if lang.startswith("zh"):
+                return bool(item.get("has_cjk"))
+            if lang.startswith("ja"):
+                return bool(item.get("has_cjk") or item.get("has_kana"))
+            if lang.startswith("ko"):
+                return bool(item.get("has_hangul") or item.get("has_cjk"))
+            if lang.startswith("bn"):
+                return bool(item.get("has_bengali"))
+            if lang.startswith("ar"):
+                return bool(item.get("has_arabic"))
+            if lang.startswith("ru"):
+                return bool(item.get("has_cyrillic"))
+            if lang.startswith(("en", "fr", "de", "es", "pt", "id", "tr", "it", "vi")):
+                return bool(item.get("has_latin") or item.get("has_digit"))
+            return True
+
+        candidates = [item for item in metrics_list if item.get("length", 0) >= 2]
+        if len(candidates) < 3:
+            return 1.0
+        return sum(1 for item in candidates if ok(item)) / len(candidates)
 
     def evaluate_cues_quality(cues: list[dict[str, str]], video_duration: float = 0.0, expected_language: str = "", role: str = "source") -> dict[str, Any]:
         if not cues:
@@ -498,6 +626,7 @@ def install(core: Any) -> None:
         texts = [str(cue.get("text") or "").strip() for cue in cues]
         unique_ratio = len(set(texts)) / max(len(texts), 1)
         total_chars = sum(len(text) for text in texts)
+        script_ratio = script_match_ratio(metrics_list, expected_language)
         metrics = {
             "cue_count": len(cues),
             "video_duration": video_duration,
@@ -511,16 +640,18 @@ def install(core: Any) -> None:
             "cjk_ratio": cjk_ratio,
             "unique_text_ratio": unique_ratio,
             "total_chars": total_chars,
+            "script_match_ratio": script_ratio,
             "expected_language": expected_language,
             "role": role,
         }
         failed = False
         reason = ""
-        if video_duration >= 300 and len(cues) < 20:
+        hard = role != "original_download"
+        if hard and video_duration >= 300 and len(cues) < 20:
             failed, reason = True, "too_few_cues"
-        elif avg_duration > 15:
+        elif hard and avg_duration > 15:
             failed, reason = True, "average_cue_too_long"
-        elif max_duration > 60 and role == "source":
+        elif role == "source" and max_duration > 60:
             failed, reason = True, "maximum_cue_too_long"
         elif emoji_only > 0.10:
             failed, reason = True, "emoji_only"
@@ -528,12 +659,14 @@ def install(core: Any) -> None:
             failed, reason = True, "punctuation_only"
         elif single_char > 0.25:
             failed, reason = True, "single_character"
-        elif letter_ratio < 0.25:
+        elif hard and letter_ratio < 0.20:
             failed, reason = True, "low_letter_ratio"
         elif unique_ratio < 0.35:
             failed, reason = True, "duplicate_text"
-        elif total_chars < max(20, len(cues)):
+        elif hard and total_chars < max(20, len(cues)):
             failed, reason = True, "too_little_text"
+        elif role in {"source", "translation"} and expected_language and script_ratio < 0.35:
+            failed, reason = True, "script_mismatch"
         elif role == "translation" and expected_language.startswith("zh") and cjk_ratio < 0.35:
             failed, reason = True, "not_enough_chinese"
         elif role == "translation" and expected_language.startswith("zh") and kana_ratio > 0.15:
@@ -801,9 +934,15 @@ def install(core: Any) -> None:
             if model not in used_models:
                 used_models.append(model)
             return candidate, used_models, True, quality
+        if "STRUCTURE" in last_error:
+            code, message = "SUBTITLE_TRANSLATION_STRUCTURE_FAILED", "翻译结果结构异常，已保留原字幕"
+        elif "QUALITY" in last_error:
+            code, message = "SUBTITLE_TRANSLATION_QUALITY_FAILED", "翻译质量未达标，已保留原字幕"
+        else:
+            code, message = "SUBTITLE_TRANSLATION_FAILED", "翻译失败，已保留原字幕"
         raise RuntimeError(json.dumps({
-            "code": "SUBTITLE_TRANSLATION_QUALITY_FAILED" if "QUALITY" in last_error else "SUBTITLE_TRANSLATION_FAILED",
-            "message": "翻译质量未达标，已保留原字幕" if "QUALITY" in last_error or "STRUCTURE" in last_error else "翻译失败，已保留原字幕",
+            "code": code,
+            "message": message,
             "detail": last_error[:200],
         }, ensure_ascii=False))
 
@@ -914,15 +1053,36 @@ def install(core: Any) -> None:
                     "code": "ASR_QUALITY_FAILED",
                     "message": "语音识别结果质量过低，未生成字幕。",
                 }, ensure_ascii=False))
+            metrics = text_metrics(text)
+            if metrics["is_emoji_only"] or metrics["is_punct_only"] or metrics["letter_ratio"] < 0.18:
+                raise RuntimeError(json.dumps({
+                    "code": "ASR_QUALITY_FAILED",
+                    "message": "语音识别结果质量过低，未生成字幕。",
+                }, ensure_ascii=False))
             span = max(chunk_end - chunk_start, 0.1)
-            # Cap each estimated cue to about 2-7 seconds, never over 10 seconds.
-            max_piece_duration = min(7.0, max(2.0, span / max(len(parts), 1)))
-            max_piece_duration = min(max_piece_duration, 10.0)
+            max_cues = max(1, int(span // 2))
+            while len(parts) > max_cues and len(parts) > 1:
+                merged = []
+                i = 0
+                while i < len(parts):
+                    if i + 1 < len(parts):
+                        merged.append((parts[i] + " " + parts[i + 1]).strip())
+                        i += 2
+                    else:
+                        merged.append(parts[i])
+                        i += 1
+                if len(merged) >= len(parts):
+                    break
+                parts = merged
+            piece_duration = min(10.0, max(2.0, min(7.0, span / max(len(parts), 1))))
             cursor = chunk_start
-            for part in parts:
-                cue_end = min(chunk_end, cursor + max_piece_duration)
+            for part_index, part in enumerate(parts):
+                if part_index == len(parts) - 1:
+                    cue_end = chunk_end
+                else:
+                    cue_end = min(chunk_end, cursor + piece_duration)
                 if cue_end <= cursor:
-                    cue_end = min(chunk_end, cursor + 2.0)
+                    cue_end = min(chunk_end, cursor + 0.5)
                 cues.append({
                     "id": str(len(cues) + 1),
                     "start": srt_time(cursor),
@@ -930,8 +1090,6 @@ def install(core: Any) -> None:
                     "text": part,
                 })
                 cursor = cue_end
-                if cursor >= chunk_end:
-                    break
         quality = evaluate_cues_quality(cues, video_duration=total, role="source")
         if not quality["passed"] or any(cue_duration_seconds(cue) > 10.5 for cue in cues):
             raise RuntimeError(json.dumps({
@@ -989,17 +1147,32 @@ def install(core: Any) -> None:
             duration_seconds = float((task.get("options") or {}).get("media_duration_seconds") or 0)
         except (TypeError, ValueError):
             duration_seconds = 0.0
-        source_quality = None
-        if source_type.startswith("platform"):
-            source_quality = assert_source_quality(cues, video_duration=duration_seconds, language=source_language)
-        elif source_type == "sensevoice":
-            source_quality = evaluate_cues_quality(cues, video_duration=duration_seconds, role="source")
-            if not source_quality["passed"]:
+        source_quality = evaluate_cues_quality(
+            cues,
+            video_duration=duration_seconds,
+            expected_language=source_language if source_language not in {"auto", "und", ""} else "",
+            role="original_download" if mode == "original" else "source",
+        )
+        if mode == "original":
+            # Advisory only for pure original downloads.
+            pass
+        elif source_type == "sensevoice" and not source_quality.get("passed"):
+            raise RuntimeError(json.dumps({
+                "code": "ASR_QUALITY_FAILED",
+                "message": "语音识别结果质量过低，未生成字幕。",
+                "detail": source_quality.get("reason"),
+            }, ensure_ascii=False))
+        elif source_type.startswith("platform") and mode in {"translated", "bilingual"} and not source_quality.get("passed"):
+            if source_language and float((source_quality.get("metrics") or {}).get("script_match_ratio") or 1) < 0.35:
                 raise RuntimeError(json.dumps({
-                    "code": "ASR_QUALITY_FAILED",
-                    "message": "语音识别结果质量过低，未生成字幕。",
-                    "detail": source_quality.get("reason"),
+                    "code": "SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN",
+                    "message": "无法可靠识别源语言，未继续翻译。",
                 }, ensure_ascii=False))
+            raise RuntimeError(json.dumps({
+                "code": "SUBTITLE_SOURCE_QUALITY_FAILED",
+                "message": "平台字幕质量异常，未继续翻译。",
+                "detail": source_quality.get("reason"),
+            }, ensure_ascii=False))
         original = work / f"{title}.original.{source_language or 'und'}.srt"
         write_srt(original, cues)
         files = [original]
@@ -1011,7 +1184,8 @@ def install(core: Any) -> None:
         same_language = bool(source_language and source_language != "auto" and normalize_lang(source_language) == target)
         # Only direct-use high-quality target manual platform subtitles.
         direct_target = source_type == "platform_target_manual"
-        need_translation = mode in {"translated", "bilingual"} and not same_language and not direct_target
+        platform_auto_target = source_type == "platform_auto_translated_target"
+        need_translation = mode in {"translated", "bilingual"} and not same_language and not direct_target and not platform_auto_target
         if need_translation and core.is_guest_task(task):
             policy = core.task_policy(task)
             if duration_seconds and duration_seconds > int(policy.get("subtitle_translation_max_duration_minutes", 60)) * 60:
@@ -1072,10 +1246,9 @@ def install(core: Any) -> None:
                     code, message = friendly_error(str(exc), task.get("url") or "")
                     if not code.startswith("GUEST_") and not code.startswith("SUBTITLE_") and not code.startswith("SILICONFLOW_"):
                         code, message = "SUBTITLE_TRANSLATION_FAILED", "翻译失败，已保留原字幕"
-                if code in {"GUEST_TRANSLATION_HOURLY_LIMIT", "GUEST_TRANSLATION_BUSY", "GUEST_TRANSLATION_DURATION_LIMIT", "ASR_QUALITY_FAILED", "SUBTITLE_SOURCE_QUALITY_FAILED"}:
+                if code in {"GUEST_TRANSLATION_HOURLY_LIMIT", "GUEST_TRANSLATION_BUSY", "GUEST_TRANSLATION_DURATION_LIMIT", "ASR_QUALITY_FAILED", "SUBTITLE_SOURCE_QUALITY_FAILED", "SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN"}:
                     raise RuntimeError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
-                if source_type == "sensevoice":
-                    raise RuntimeError(json.dumps({"code": "ASR_QUALITY_FAILED", "message": "语音识别结果质量过低，未生成字幕。"}, ensure_ascii=False))
+                # Keep qualified ASR/platform original when translation fails.
                 warning = {
                     "code": code if code.startswith("SUBTITLE_") else "SUBTITLE_TRANSLATION_FAILED",
                     "message": message if code.startswith("SUBTITLE_") else "翻译失败，已保留原字幕",
@@ -1089,10 +1262,25 @@ def install(core: Any) -> None:
         elif mode == "bilingual" and same_language:
             primary = original
         elif direct_target and mode == "translated":
+            checked = evaluate_cues_quality(cues, video_duration=duration_seconds, expected_language=target, role="source")
+            source_quality = checked
+            if checked.get("passed"):
+                translated_path = work / f"{title}.translated.{target}.srt"
+                write_srt(translated_path, cues)
+                files.append(translated_path)
+                primary = translated_path
+            else:
+                warning = {"code": "SUBTITLE_SOURCE_QUALITY_FAILED", "message": "平台字幕质量异常，已提供原字幕。"}
+                primary = original
+        elif platform_auto_target and mode in {"translated", "bilingual"}:
             translated_path = work / f"{title}.translated.{target}.srt"
             write_srt(translated_path, cues)
             files.append(translated_path)
             primary = translated_path
+            warning = {
+                "code": "PLATFORM_AUTO_TRANSLATED_SUBTITLE_USED",
+                "message": "已使用平台自动翻译字幕，质量可能不稳定",
+            }
         catalog = catalog or {}
         meta = {
             "source_language": source_language or "und",
@@ -1102,19 +1290,21 @@ def install(core: Any) -> None:
             "models_used": models_used,
             "cue_count": len(cues),
             "source_cue_count": len(cues),
-            "translated_cue_count": len(cues) if translated_flag or direct_target else 0,
-            "translated": translated_flag or direct_target,
+            "translated_cue_count": len(cues) if (translated_flag or (direct_target and primary != original) or platform_auto_target) else 0,
+            "translated": bool(translated_flag),
             "source_type": source_type,
             "platform_original_language": catalog.get("media_language") or "",
             "requested_source_language": opts["subtitle_source_language"],
             "detected_source_language": source_language or "und",
             "source_quality_passed": bool(source_quality and source_quality.get("passed")),
-            "translation_quality_passed": bool(translation_quality and translation_quality.get("passed")) if translation_quality else (False if need_translation else True),
+            "translation_quality_passed": bool(translation_quality and translation_quality.get("passed")) if translation_quality is not None else False,
             "source_quality_metrics": (source_quality or {}).get("metrics") or {},
             "translation_quality_metrics": (translation_quality or {}).get("metrics") or {},
             "timing_estimated": source_type == "sensevoice",
+            "quality_warning": bool((source_quality and not source_quality.get("passed")) or platform_auto_target),
             "translation_skipped_same_language": bool(same_language and mode != "original"),
-            "fallback_to_original": bool(warning is not None),
+            "fallback_to_original": bool(warning is not None and primary == original),
+            "fallback_to_platform_auto_translation": bool(platform_auto_target),
             "fallback_reason": (warning or {}).get("code"),
             "available_manual_subtitles": catalog.get("manual") or [],
             "available_auto_subtitles": catalog.get("auto") or [],
@@ -1144,7 +1334,7 @@ def install(core: Any) -> None:
             media_language = catalog.get("media_language") or ""
             if media_language:
                 core.patch(task_id, status="processing", progress=7, eta=f"正在下载{languages.get(media_language, media_language)}字幕")
-            platform_files = download_platform_subtitles(task, work, cookie, source, target, media_language=media_language)
+            platform_files = download_platform_subtitles(task, work, cookie, source, target, media_language=media_language, catalog=catalog)
             source_meta = None
             source_type = "none"
             source_path = None
@@ -1189,7 +1379,7 @@ def install(core: Any) -> None:
                 chunks = make_chunks(task, audio, work, total)
                 source_path = create_asr_srt(task, work, chunks, total, key)
                 source_type = "sensevoice"
-                source_language = media_language or "auto"
+                source_language = media_language or "und"
             else:
                 source_language = normalize_lang(source_meta.get("language") if source_meta else media_language or "und") or "und"
                 key = get_key()
@@ -1224,9 +1414,7 @@ def install(core: Any) -> None:
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
                 finish(task, primary, [original, primary, meta_path])
                 return
-            if source_type.startswith("platform_auto_translated") and not media_language:
-                # Keep only as last resort and mark quality warning via build_outputs metadata.
-                pass
+            # platform_auto_translated_* is handled as last-resort path inside build_outputs.
             primary, files, warning = build_outputs(
                 task, work, source_path, source_language if source_path else "auto", source_type, get_key(), catalog=catalog
             )
