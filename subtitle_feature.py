@@ -266,6 +266,19 @@ def install(core: Any) -> None:
                 lang = normalize_lang(match.group(1)) or match.group(1)
         return {"path": path, "language": lang, "auto": bool(auto), "size": path.stat().st_size if path.is_file() else 0}
 
+    def language_priority(lang: str, source: str, target: str) -> int:
+        order: list[str] = []
+        for item in [target, source if source and source != "auto" else "", "en"]:
+            code = str(item or "").strip()
+            if code and code not in order:
+                order.append(code)
+        for code in languages:
+            if code not in order:
+                order.append(code)
+        if lang in order:
+            return order.index(lang)
+        return len(order) + 1
+
     def score_subtitle(meta: dict[str, Any], source: str, target: str, prefer_target: bool) -> tuple:
         lang = normalize_lang(meta.get("language")) or "und"
         auto = bool(meta.get("auto"))
@@ -278,61 +291,60 @@ def install(core: Any) -> None:
         if prefer_target:
             # translated mode: target first, then explicit source, then manual before auto.
             if is_target and not auto:
-                rank = 0
+                quality_rank = 0
             elif is_target and auto:
-                rank = 1
+                quality_rank = 1
             elif is_source and not auto:
-                rank = 2
+                quality_rank = 2
             elif is_source and auto:
-                rank = 3
+                quality_rank = 3
             elif is_en and not auto:
-                rank = 4
+                quality_rank = 4
             elif supported and not auto:
-                rank = 5
+                quality_rank = 5
             elif is_en and auto:
-                rank = 6
+                quality_rank = 6
             elif supported and auto:
-                rank = 7
+                quality_rank = 7
             elif not auto:
-                rank = 8
+                quality_rank = 8
             else:
-                rank = 9
-            return (rank, size_rank)
-
-        if source and source != "auto":
+                quality_rank = 9
+        elif source and source != "auto":
             # explicit source language
             if is_source and not auto:
-                rank = 0
+                quality_rank = 0
             elif is_source and auto:
-                rank = 1
+                quality_rank = 1
             elif is_en and not auto:
-                rank = 2
+                quality_rank = 2
             elif supported and not auto:
-                rank = 3
+                quality_rank = 3
             elif is_en and auto:
-                rank = 4
+                quality_rank = 4
             elif supported and auto:
-                rank = 5
+                quality_rank = 5
             elif not auto:
-                rank = 6
+                quality_rank = 6
             else:
-                rank = 7
-            return (rank, size_rank)
-
-        # source=auto
-        if is_en and not auto:
-            rank = 0
-        elif supported and not auto:
-            rank = 1
-        elif is_en and auto:
-            rank = 2
-        elif supported and auto:
-            rank = 3
-        elif not auto:
-            rank = 4
+                quality_rank = 7
         else:
-            rank = 5
-        return (rank, size_rank)
+            # source=auto
+            if is_en and not auto:
+                quality_rank = 0
+            elif supported and not auto:
+                quality_rank = 1
+            elif is_en and auto:
+                quality_rank = 2
+            elif supported and auto:
+                quality_rank = 3
+            elif not auto:
+                quality_rank = 4
+            else:
+                quality_rank = 5
+
+        # size only breaks ties for the same quality rank and same language.
+        return (quality_rank, language_priority(lang, source, target), size_rank)
 
     def download_platform_subtitles(task: dict[str, Any], work: Path, cookie: Path | None, source: str, target: str) -> list[dict[str, Any]]:
         candidates = language_candidates(source, target)

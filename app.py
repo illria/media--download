@@ -129,17 +129,24 @@ def normalize_guest_policy(raw=None):
     return policy
 def guest_policy():return normalize_guest_policy(settings().get('guest_policy'))
 def normalize_subtitle_language(value,allow_auto=False,default='zh-CN',required=False,field_name='language'):
-    aliases={'zh':'zh-CN','zh-Hans':'zh-CN','zh-Hant':'zh-TW','cn':'zh-CN','jp':'ja','kr':'ko'}
-    if value is None or str(value).strip()=='':
+    aliases={
+        'zh':'zh-CN','zh-hans':'zh-CN','zh-hant':'zh-TW','cn':'zh-CN','jp':'ja','kr':'ko',
+        'zh-cn':'zh-CN','zh-tw':'zh-TW',
+    }
+    if value is None or (isinstance(value,str) and value.strip()==''):
         if required:raise ValueError(field_name)
         return default
     code=str(value).strip()
-    if allow_auto and code=='auto':return 'auto'
+    if allow_auto and code.lower()=='auto':return 'auto'
     if code in SUBTITLE_LANGUAGES:return code
-    if code in aliases:return aliases[code]
+    # case-insensitive match against canonical language codes
+    lowered={key.lower():key for key in SUBTITLE_LANGUAGES}
+    if code.lower() in lowered:return lowered[code.lower()]
+    alias=aliases.get(code.lower())
+    if alias:return alias
     raise ValueError(field_name)
 def normalize_subtitle_output_mode(value,default='translated',required=False):
-    if value is None or str(value).strip()=='':
+    if value is None or (isinstance(value,str) and value.strip()==''):
         if required:raise ValueError('output_mode')
         return default
     mode=str(value).strip().lower()
@@ -148,9 +155,10 @@ def normalize_subtitle_output_mode(value,default='translated',required=False):
 def subtitle_options_from_payload(incoming,policy=None,guest=False,probed=None):
     policy=policy or guest_policy()
     incoming=incoming if isinstance(incoming,dict) else {}
-    source_present='subtitle_source_language' in incoming and incoming.get('subtitle_source_language') is not None and str(incoming.get('subtitle_source_language')).strip()!=''
-    target_present='subtitle_target_language' in incoming and incoming.get('subtitle_target_language') is not None and str(incoming.get('subtitle_target_language')).strip()!=''
-    mode_present='subtitle_output_mode' in incoming and incoming.get('subtitle_output_mode') is not None and str(incoming.get('subtitle_output_mode')).strip()!=''
+    # Key presence only — empty/null values are invalid when the field is submitted.
+    source_present='subtitle_source_language' in incoming
+    target_present='subtitle_target_language' in incoming
+    mode_present='subtitle_output_mode' in incoming
     try:
         source=normalize_subtitle_language(incoming.get('subtitle_source_language'),allow_auto=True,default='auto',required=source_present,field_name='source')
     except ValueError:
