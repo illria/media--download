@@ -1,6 +1,17 @@
 (() => {
   const TOKEN_KEY = 'mediaToken';
   const KOOFR_TTL_MS = 45000;
+  const DEFAULT_TRANSLATION_MODELS = [
+    'tencent/Hunyuan-MT-7B',
+    'Qwen/Qwen3.5-4B',
+    'Qwen/Qwen2.5-7B-Instruct',
+    'THUDM/GLM-4-9B-0414',
+  ];
+  const DEFAULT_FALLBACK_MODELS = [
+    'Qwen/Qwen3.5-4B',
+    'Qwen/Qwen2.5-7B-Instruct',
+    'THUDM/GLM-4-9B-0414',
+  ];
   const PAGE_TITLES = {
     dashboard: '仪表盘',
     probe: '解析下载',
@@ -704,43 +715,91 @@
 
   async function loadAiSettings() {
     const status = document.getElementById('aiStatus');
+    const saveBtn = document.getElementById('saveAiBtn');
+    if (saveBtn) saveBtn.disabled = true;
+    populateDefaultTranslationModels();
     try {
       const data = await adminApi('/api/admin/transcription/settings');
       status.textContent = data.configured
         ? `AI 字幕已配置 · 识别 ${data.asr_model || data.model || '-'} · 来源 ${data.source || '-'}`
         : 'AI 字幕未配置：只能下载平台已有字幕';
       status.className = data.configured ? 'good' : 'muted';
-      const models = data.supported_translation_models || [
-        'tencent/Hunyuan-MT-7B',
-        'Qwen/Qwen3.5-4B',
-        'Qwen/Qwen2.5-7B-Instruct',
-        'THUDM/GLM-4-9B-0414',
-      ];
+      const returnedModels = validTranslationModels(data.supported_translation_models);
+      const models = returnedModels.length ? returnedModels : DEFAULT_TRANSLATION_MODELS;
       const fill = (id, selected, allowNone = false) => {
         const node = document.getElementById(id);
         if (!node) return;
         node.innerHTML = (allowNone ? '<option value="">无</option>' : '') + models.map((model) => (
           `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`
         )).join('');
+        if (!node.options.length && !allowNone) {
+          node.innerHTML = `<option value="${escapeHtml(DEFAULT_TRANSLATION_MODELS[0])}">${escapeHtml(DEFAULT_TRANSLATION_MODELS[0])}</option>`;
+        }
         if (selected && models.includes(selected)) node.value = selected;
-        else if (allowNone) node.value = selected || '';
+        else if (!allowNone) {
+          node.value = models.includes('tencent/Hunyuan-MT-7B')
+            ? 'tencent/Hunyuan-MT-7B'
+            : (models[0] || DEFAULT_TRANSLATION_MODELS[0]);
+        } else {
+          node.value = selected || '';
+        }
       };
       document.getElementById('translationEnabled').value = data.translation_enabled === false ? 'false' : 'true';
       fill('translationModel', data.translation_model || 'tencent/Hunyuan-MT-7B', false);
-      const fallbacks = data.translation_fallback_models || [];
+      const hasFallbackField = Object.prototype.hasOwnProperty.call(data || {}, 'translation_fallback_models');
+      const fallbacks = hasFallbackField
+        ? (Array.isArray(data.translation_fallback_models) ? data.translation_fallback_models : [])
+        : DEFAULT_FALLBACK_MODELS;
       fill('translationFallback1', fallbacks[0] || '', true);
       fill('translationFallback2', fallbacks[1] || '', true);
       fill('translationFallback3', fallbacks[2] || '', true);
       const asr = document.getElementById('asrModelDisplay');
       if (asr) asr.value = data.asr_model || data.model || 'FunAudioLLM/SenseVoiceSmall';
     } catch {
-      status.textContent = '无法读取 AI 字幕配置';
-      status.className = 'error';
+      populateDefaultTranslationModels();
+      if (status) {
+        status.textContent = '无法读取服务器模型配置，当前显示默认模型列表';
+        status.className = 'error';
+      }
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
     }
+  }
+
+  function validTranslationModels(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((item) => typeof item === 'string')
+      .map((item) => item.trim())
+      .filter((item, index, array) => (
+        item
+        && DEFAULT_TRANSLATION_MODELS.includes(item)
+        && array.indexOf(item) === index
+      ));
+  }
+
+  function populateDefaultTranslationModels() {
+    const fill = (id, selected, allowNone = false) => {
+      const node = document.getElementById(id);
+      if (!node) return;
+      node.innerHTML = (allowNone ? '<option value="">无</option>' : '') + DEFAULT_TRANSLATION_MODELS.map((model) => (
+        `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`
+      )).join('');
+      if (selected && DEFAULT_TRANSLATION_MODELS.includes(selected)) node.value = selected;
+      else if (!allowNone) node.value = 'tencent/Hunyuan-MT-7B';
+      else node.value = selected || '';
+    };
+    fill('translationModel', 'tencent/Hunyuan-MT-7B', false);
+    fill('translationFallback1', DEFAULT_FALLBACK_MODELS[0], true);
+    fill('translationFallback2', DEFAULT_FALLBACK_MODELS[1], true);
+    fill('translationFallback3', DEFAULT_FALLBACK_MODELS[2], true);
   }
 
   function collectTranslationModels() {
     const primary = document.getElementById('translationModel')?.value || '';
+    if (!primary || !DEFAULT_TRANSLATION_MODELS.includes(primary)) {
+      throw new Error('请选择有效的翻译主模型');
+    }
     const fallbacks = [
       document.getElementById('translationFallback1')?.value || '',
       document.getElementById('translationFallback2')?.value || '',
@@ -748,9 +807,10 @@
     ].filter(Boolean);
     const unique = [];
     for (const item of fallbacks) {
+      if (!DEFAULT_TRANSLATION_MODELS.includes(item)) continue;
       if (item !== primary && !unique.includes(item)) unique.push(item);
     }
-    if (unique.length !== fallbacks.filter((item) => item && item !== primary).length) {
+    if (unique.length !== fallbacks.filter((item) => item && item !== primary && DEFAULT_TRANSLATION_MODELS.includes(item)).length) {
       throw new Error('备用模型不能重复，且不能与主模型相同');
     }
     return { translation_model: primary, translation_fallback_models: unique };

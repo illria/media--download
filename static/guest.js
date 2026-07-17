@@ -188,20 +188,44 @@
     return Number(state.limits.default_resolution || DEFAULT_LIMITS.default_resolution);
   }
 
+  function validLanguageMap(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.entries(value).filter(([code, label]) => (
+      typeof code === 'string'
+      && code.trim()
+      && code !== 'auto'
+      && typeof label === 'string'
+      && label.trim()
+    ));
+    return entries.length ? Object.fromEntries(entries) : null;
+  }
+
   function fillLanguageSelects() {
-    const langs = state.limits.supported_subtitle_languages || DEFAULT_LIMITS.supported_subtitle_languages;
     if (!el.subtitleSourceLanguage || !el.subtitleTargetLanguage || !el.subtitleOutputMode) return;
+    const langs = validLanguageMap(state.limits.supported_subtitle_languages)
+      || validLanguageMap(DEFAULT_LIMITS.supported_subtitle_languages)
+      || { 'zh-CN': '简体中文' };
     const sourceValue = el.subtitleSourceLanguage.value || 'auto';
     const targetValue = el.subtitleTargetLanguage.value || 'zh-CN';
     const modeValue = el.subtitleOutputMode.value || 'translated';
-    el.subtitleSourceLanguage.innerHTML = '<option value="auto">自动选择</option>' + Object.entries(langs).map(([code, label]) => (
+    const languageOptions = Object.entries(langs).map(([code, label]) => (
       `<option value="${escapeHtml(code)}">${escapeHtml(label)}</option>`
     )).join('');
-    el.subtitleTargetLanguage.innerHTML = Object.entries(langs).map(([code, label]) => (
-      `<option value="${escapeHtml(code)}">${escapeHtml(label)}</option>`
-    )).join('');
-    el.subtitleSourceLanguage.value = sourceValue;
-    el.subtitleTargetLanguage.value = targetValue in langs ? targetValue : 'zh-CN';
+    el.subtitleSourceLanguage.innerHTML = `<option value="auto">自动选择</option>${languageOptions}`;
+    el.subtitleTargetLanguage.innerHTML = languageOptions || '<option value="zh-CN">简体中文</option>';
+    if (!el.subtitleTargetLanguage.options.length) {
+      el.subtitleTargetLanguage.innerHTML = '<option value="zh-CN" selected>简体中文</option>';
+    }
+    el.subtitleSourceLanguage.value = sourceValue === 'auto' || Object.prototype.hasOwnProperty.call(langs, sourceValue)
+      ? sourceValue
+      : 'auto';
+    if (Object.prototype.hasOwnProperty.call(langs, targetValue)) {
+      el.subtitleTargetLanguage.value = targetValue;
+    } else if (Object.prototype.hasOwnProperty.call(langs, 'zh-CN')) {
+      el.subtitleTargetLanguage.value = 'zh-CN';
+    } else {
+      el.subtitleTargetLanguage.selectedIndex = 0;
+    }
     if (!state.limits.allow_subtitle_translation) {
       el.subtitleOutputMode.innerHTML = '<option value="original" selected>仅原字幕</option>';
       el.subtitleTargetLanguage.disabled = true;
@@ -232,7 +256,8 @@
       allow_subtitle_translation: limits.allow_subtitle_translation !== false,
       subtitle_translation_max_duration_minutes: Number(limits.subtitle_translation_max_duration_minutes) || DEFAULT_LIMITS.subtitle_translation_max_duration_minutes,
       subtitle_translation_hourly_limit_per_guest: Number(limits.subtitle_translation_hourly_limit_per_guest) || DEFAULT_LIMITS.subtitle_translation_hourly_limit_per_guest,
-      supported_subtitle_languages: limits.supported_subtitle_languages || DEFAULT_LIMITS.supported_subtitle_languages,
+      supported_subtitle_languages: validLanguageMap(limits.supported_subtitle_languages)
+        || DEFAULT_LIMITS.supported_subtitle_languages,
     };
     if (el.chipFileLimit) el.chipFileLimit.textContent = `单文件最大 ${state.limits.max_file_size_gb} GB`;
     if (el.chipMaxRes) el.chipMaxRes.textContent = `最高 ${state.limits.max_resolution}p`;
@@ -411,10 +436,15 @@
       if (selected && selected.format_id) options.format_id = String(selected.format_id);
       options.audio_format = 'mp3';
     } else if (mode === 'subtitles') {
+      if (!el.subtitleTargetLanguage || !el.subtitleTargetLanguage.options.length || !el.subtitleTargetLanguage.value) {
+        el.createStatus.textContent = '请选择目标语言';
+        el.createStatus.className = 'live-region error';
+        return;
+      }
       const outputMode = el.subtitleOutputMode?.value || 'translated';
       options.subtitle_output_mode = state.limits.allow_subtitle_translation ? outputMode : 'original';
       options.subtitle_source_language = el.subtitleSourceLanguage?.value || 'auto';
-      options.subtitle_target_language = el.subtitleTargetLanguage?.value || 'zh-CN';
+      options.subtitle_target_language = el.subtitleTargetLanguage.value;
     }
     el.createStatus.textContent = '正在创建任务…';
     el.createStatus.className = 'live-region muted';

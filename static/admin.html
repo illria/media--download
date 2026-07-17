@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>管理员控制台 · Media Download Hub</title>
-  <link rel="stylesheet" href="/assets/theme.css">
+  <link rel="stylesheet" href="/assets/theme.css?v=003d">
 </head>
 <body>
   <div id="loginView" class="login-wrap">
@@ -231,19 +231,42 @@
               </div>
               <div class="field">
                 <label for="translationModel">翻译主模型</label>
-                <select id="translationModel"></select>
+                <select id="translationModel">
+                  <option value="tencent/Hunyuan-MT-7B" selected>tencent/Hunyuan-MT-7B</option>
+                  <option value="Qwen/Qwen3.5-4B">Qwen/Qwen3.5-4B</option>
+                  <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B-Instruct</option>
+                  <option value="THUDM/GLM-4-9B-0414">THUDM/GLM-4-9B-0414</option>
+                </select>
               </div>
               <div class="field">
                 <label for="translationFallback1">备用模型 1</label>
-                <select id="translationFallback1"></select>
+                <select id="translationFallback1">
+                  <option value="">无</option>
+                  <option value="tencent/Hunyuan-MT-7B">tencent/Hunyuan-MT-7B</option>
+                  <option value="Qwen/Qwen3.5-4B" selected>Qwen/Qwen3.5-4B</option>
+                  <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B-Instruct</option>
+                  <option value="THUDM/GLM-4-9B-0414">THUDM/GLM-4-9B-0414</option>
+                </select>
               </div>
               <div class="field">
                 <label for="translationFallback2">备用模型 2</label>
-                <select id="translationFallback2"></select>
+                <select id="translationFallback2">
+                  <option value="">无</option>
+                  <option value="tencent/Hunyuan-MT-7B">tencent/Hunyuan-MT-7B</option>
+                  <option value="Qwen/Qwen3.5-4B">Qwen/Qwen3.5-4B</option>
+                  <option value="Qwen/Qwen2.5-7B-Instruct" selected>Qwen/Qwen2.5-7B-Instruct</option>
+                  <option value="THUDM/GLM-4-9B-0414">THUDM/GLM-4-9B-0414</option>
+                </select>
               </div>
               <div class="field">
                 <label for="translationFallback3">备用模型 3</label>
-                <select id="translationFallback3"></select>
+                <select id="translationFallback3">
+                  <option value="">无</option>
+                  <option value="tencent/Hunyuan-MT-7B">tencent/Hunyuan-MT-7B</option>
+                  <option value="Qwen/Qwen3.5-4B">Qwen/Qwen3.5-4B</option>
+                  <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B-Instruct</option>
+                  <option value="THUDM/GLM-4-9B-0414" selected>THUDM/GLM-4-9B-0414</option>
+                </select>
               </div>
             </div>
             <div class="row" style="margin-top:8px">
@@ -321,6 +344,6 @@
       </main>
     </div>
   </div>
-  <script src="/assets/admin.js" defer></script>
+  <script src="/assets/admin.js?v=003d" defer></script>
 </body>
 </html>
