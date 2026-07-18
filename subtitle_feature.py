@@ -777,6 +777,7 @@ def install(core: Any) -> None:
                 "code": "SUBTITLE_TRANSLATION_QUALITY_FAILED",
                 "message": "翻译质量未达标，已保留原字幕",
                 "detail": report.get("reason"),
+                "translation_quality_metrics": (report.get("metrics") or {}),
             }, ensure_ascii=False))
         return report
 
@@ -873,26 +874,47 @@ def install(core: Any) -> None:
     def validate_translations(batch: list[dict[str, str]], payload: dict[str, Any], target_language: str = "") -> dict[str, str]:
         items = payload.get("translations")
         if not isinstance(items, list):
-            raise RuntimeError("SUBTITLE_TRANSLATION_RESPONSE_INVALID")
+            raise RuntimeError(json.dumps({
+                "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
+                "failure_stage": "batch_validation",
+            }, ensure_ascii=False))
         mapping: dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
-                raise RuntimeError("SUBTITLE_TRANSLATION_RESPONSE_INVALID")
+                raise RuntimeError(json.dumps({
+                    "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
+                    "failure_stage": "batch_validation",
+                }, ensure_ascii=False))
             item_id = str(item.get("id") or "").strip()
             text = str(item.get("text") or "").strip()
             if not item_id or not text:
-                raise RuntimeError("SUBTITLE_TRANSLATION_EMPTY")
+                raise RuntimeError(json.dumps({
+                    "code": "SUBTITLE_TRANSLATION_EMPTY",
+                    "failure_stage": "batch_validation",
+                }, ensure_ascii=False))
             if item_id in mapping:
-                raise RuntimeError("SUBTITLE_TRANSLATION_ID_MISMATCH")
+                raise RuntimeError(json.dumps({
+                    "code": "SUBTITLE_TRANSLATION_ID_MISMATCH",
+                    "failure_stage": "batch_validation",
+                }, ensure_ascii=False))
             metrics = text_metrics(text)
             if metrics["is_emoji_only"] or metrics["is_punct_only"]:
-                raise RuntimeError("SUBTITLE_TRANSLATION_QUALITY_FAILED")
+                raise RuntimeError(json.dumps({
+                    "code": "SUBTITLE_TRANSLATION_QUALITY_FAILED",
+                    "failure_stage": "batch_validation",
+                }, ensure_ascii=False))
             if target_language.startswith("zh") and metrics["has_kana"] and not metrics["has_cjk"]:
-                raise RuntimeError("SUBTITLE_TRANSLATION_QUALITY_FAILED")
+                raise RuntimeError(json.dumps({
+                    "code": "SUBTITLE_TRANSLATION_QUALITY_FAILED",
+                    "failure_stage": "batch_validation",
+                }, ensure_ascii=False))
             mapping[item_id] = text
         expected = {cue["id"] for cue in batch}
         if set(mapping) != expected:
-            raise RuntimeError("SUBTITLE_TRANSLATION_ID_MISMATCH")
+            raise RuntimeError(json.dumps({
+                "code": "SUBTITLE_TRANSLATION_ID_MISMATCH",
+                "failure_stage": "batch_validation",
+            }, ensure_ascii=False))
         return mapping
 
     def call_translation_model(model: str, key: str, source_language: str, target_language: str, batch: list[dict[str, str]]) -> dict[str, str]:
@@ -944,22 +966,35 @@ def install(core: Any) -> None:
         try:
             data = response.json()
         except Exception as exc:
-            raise RuntimeError("SUBTITLE_TRANSLATION_RESPONSE_INVALID") from exc
+            raise RuntimeError(json.dumps({
+                "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
+                "failure_stage": "response_parse",
+            }, ensure_ascii=False)) from exc
         content = ""
         try:
             content = data["choices"][0]["message"]["content"]
         except Exception as exc:
-            raise RuntimeError("SUBTITLE_TRANSLATION_RESPONSE_INVALID") from exc
+            raise RuntimeError(json.dumps({
+                "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
+                "failure_stage": "response_parse",
+            }, ensure_ascii=False)) from exc
         try:
             parsed = extract_json_payload(str(content or ""))
         except Exception as exc:
-            raise RuntimeError("SUBTITLE_TRANSLATION_RESPONSE_INVALID") from exc
+            raise RuntimeError(json.dumps({
+                "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
+                "failure_stage": "response_parse",
+            }, ensure_ascii=False)) from exc
         return validate_translations(batch, parsed, target_language=target_language)
 
     def classify_translation_failure_stage(error: str, *, quality_gate_invoked: bool = False) -> str:
         text = str(error or "")
+        # If error is a structured JSON with explicit failure_stage, use it.
         try:
             parsed = json.loads(text)
+            explicit = parsed.get("failure_stage")
+            if explicit in {"request", "response_parse", "batch_validation", "structure_gate", "full_quality_gate"}:
+                return explicit
             code = str(parsed.get("code") or "")
             if code == "SUBTITLE_TRANSLATION_STRUCTURE_FAILED":
                 return "structure_gate"
@@ -979,13 +1014,14 @@ def install(core: Any) -> None:
             "SILICONFLOW_TRANSLATION_FAILED",
         )):
             return "request"
-        if "SUBTITLE_TRANSLATION_RESPONSE_INVALID" in text or "JSONDecodeError" in text:
+        if "JSONDecodeError" in text:
+            return "response_parse"
+        if "SUBTITLE_TRANSLATION_RESPONSE_INVALID" in text:
             return "response_parse"
         if any(token in text for token in (
             "SUBTITLE_TRANSLATION_EMPTY",
             "SUBTITLE_TRANSLATION_ID_MISMATCH",
             "SUBTITLE_TRANSLATION_QUALITY_FAILED",
-            "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
         )):
             return "batch_validation"
         return "request"
@@ -1087,9 +1123,9 @@ def install(core: Any) -> None:
                 metrics: dict[str, Any] = {}
                 try:
                     parsed_quality = json.loads(str(exc))
-                    detail = parsed_quality.get("detail")
-                    if isinstance(detail, dict):
-                        metrics = detail
+                    quality_metrics = parsed_quality.get("translation_quality_metrics") or {}
+                    if isinstance(quality_metrics, dict) and quality_metrics:
+                        metrics = quality_metrics
                 except Exception:
                     metrics = {}
                 record_failure(str(exc), quality_gate_invoked=True, metrics=metrics)
