@@ -1164,23 +1164,25 @@ def install(core: Any) -> None:
         failure_stage: str | None = None
         last_error = "SUBTITLE_TRANSLATION_FAILED"
         failure_reason: str | None = None
+        failure_records: list[dict[str, str]] = []
 
         def record_failure(error: str, *, quality_gate_invoked: bool, metrics: dict[str, Any] | None = None) -> None:
-            nonlocal last_error, failure_stage, translation_quality_checked, translation_quality_metrics, failure_reason
+            nonlocal last_error, translation_quality_checked, translation_quality_metrics
             last_error = str(error)
-            stage = classify_translation_failure_stage(last_error, quality_gate_invoked=quality_gate_invoked)
-            if stage_rank.get(stage, -1) >= stage_rank.get(failure_stage, -1):
-                failure_stage = stage
             if quality_gate_invoked:
                 # Full model output reached assert_translation_quality().
                 translation_quality_checked = True
                 if metrics is not None:
                     translation_quality_metrics = metrics
-            failure_reason = classify_translation_failure_reason(last_error, stage=stage, metrics=metrics)
 
         for model in models:
             candidate = [dict(cue) for cue in cues]
             model_ok = True
+            model_failure_stage: str | None = None
+            model_failure_reason: str | None = None
+            model_quality_checked = False
+            model_quality_metrics: dict[str, Any] = {}
+            model_last_error: str | None = None
             for batch_index, batch in enumerate(batches, 1):
                 ensure_not_cancelled(task["id"])
                 core.patch(task["id"], status="processing", progress=45 + batch_index / max(len(batches), 1) * 45, eta=f"正在翻译字幕 {batch_index}/{len(batches)}")
@@ -1197,13 +1199,18 @@ def install(core: Any) -> None:
                         batch_ok = True
                         break
                     except Exception as exc:
-                        record_failure(str(exc), quality_gate_invoked=False)
+                        model_last_error = str(exc)
+                        stage = classify_translation_failure_stage(model_last_error, quality_gate_invoked=False)
+                        reason = classify_translation_failure_reason(model_last_error, stage=stage)
+                        if stage_rank.get(stage, -1) >= stage_rank.get(model_failure_stage, -1):
+                            model_failure_stage, model_failure_reason = stage, reason
+                        record_failure(model_last_error, quality_gate_invoked=False)
                         continue
                 if not batch_ok:
                     model_ok = False
                     break
             if not model_ok:
-                model_failures.append({"model": model, "stage": failure_stage or "batch_validation", "reason": failure_reason or "request_failed"})
+                failure_records.append({"model": model, "stage": model_failure_stage or "request", "reason": model_failure_reason or "request_failed"})
                 continue
             # All batches completed for this model; full output quality gate runs now.
             try:
@@ -1217,13 +1224,19 @@ def install(core: Any) -> None:
                         metrics = quality_metrics
                 except Exception:
                     metrics = {}
-                record_failure(str(exc), quality_gate_invoked=True, metrics=metrics)
-                model_failures.append({"model": model, "stage": failure_stage or "full_quality_gate", "reason": failure_reason or "quality_failed"})
+                model_last_error = str(exc)
+                model_failure_stage = classify_translation_failure_stage(model_last_error, quality_gate_invoked=True)
+                model_failure_reason = classify_translation_failure_reason(model_last_error, stage=model_failure_stage, metrics=metrics)
+                model_quality_checked = True
+                model_quality_metrics = metrics
+                record_failure(model_last_error, quality_gate_invoked=True, metrics=metrics)
+                failure_records.append({"model": model, "stage": model_failure_stage or "full_quality_gate", "reason": model_failure_reason or "quality_failed"})
                 continue
             if model not in used_models:
                 used_models.append(model)
             if model not in models_succeeded:
                 models_succeeded.append(model)
+            model_failures = failure_records
             return {
                 "cues": candidate,
                 "models_used": used_models,
@@ -1239,6 +1252,14 @@ def install(core: Any) -> None:
                 "models_succeeded": models_succeeded,
                 "model_failures": model_failures,
             }
+        # Select one coherent task-level result only after every model has
+        # finished.  Per-model stage/reason pairs remain isolated above.
+        if failure_records:
+            selected = max(failure_records, key=lambda item: stage_rank.get(item.get("stage"), -1))
+            failure_stage = selected.get("stage") or "request"
+            failure_reason = selected.get("reason") or "request_failed"
+            model_failures = failure_records
+            last_error = f"{failure_stage}:{failure_reason}"
         if failure_stage == "structure_gate":
             code, message = "SUBTITLE_TRANSLATION_STRUCTURE_FAILED", "翻译结果结构异常，已保留原字幕"
         elif failure_stage in {"full_quality_gate", "batch_validation"}:
