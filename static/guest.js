@@ -54,7 +54,7 @@
     SUBTITLE_TRANSLATION_FAILED: '翻译失败，已保留原字幕。',
     PLATFORM_AUTO_TRANSLATED_SUBTITLE_USED: '已使用平台自动翻译字幕，质量可能不稳定。',
   };
-  const OUTPUT_LABEL = { original: '仅原字幕', translated: '翻译字幕', bilingual: '双语字幕' };
+  const OUTPUT_LABEL = { original: '仅源字幕', translated: '翻译字幕', bilingual: '双语字幕' };
   const STATUS_LABEL = {
     queued: '排队中',
     downloading: '下载中',
@@ -265,12 +265,12 @@
       el.subtitleTargetLanguage.selectedIndex = 0;
     }
     if (!state.limits.allow_subtitle_translation) {
-      el.subtitleOutputMode.innerHTML = '<option value="original" selected>仅原字幕</option>';
+      el.subtitleOutputMode.innerHTML = '<option value="original" selected>仅源字幕</option>';
       el.subtitleTargetLanguage.disabled = true;
       if (el.subtitleHelp) el.subtitleHelp.textContent = '当前未启用游客字幕翻译，仅可下载原字幕。';
     } else {
       el.subtitleOutputMode.innerHTML = `
-        <option value="original">仅原字幕</option>
+        <option value="original">仅源字幕</option>
         <option value="translated">翻译字幕</option>
         <option value="bilingual">双语字幕</option>`;
       el.subtitleOutputMode.value = ['original', 'translated', 'bilingual'].includes(modeValue) ? modeValue : 'translated';
