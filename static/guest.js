@@ -156,6 +156,27 @@
     return date.toLocaleString();
   }
 
+  function languageLabel(code) {
+    const value = text(code || '').trim();
+    if (!value) return '';
+    if (value.toLowerCase() === 'auto') return '自动识别';
+    const languages = state.limits.supported_subtitle_languages || DEFAULT_LIMITS.supported_subtitle_languages;
+    const exact = languages[value] || languages[value.toLowerCase()];
+    if (exact) return exact;
+    const base = value.split('-', 1)[0].toLowerCase();
+    const match = Object.entries(languages).find(([key]) => (
+      key.toLowerCase() === base || key.toLowerCase().startsWith(`${base}-`)
+    ));
+    return match ? match[1] : value;
+  }
+
+  function subtitleRouteLabel(task) {
+    if (task.subtitle_output_mode === 'original') return '';
+    const source = task.detected_source_language || task.subtitle_source_language || 'auto';
+    const target = task.subtitle_target_language || 'zh-CN';
+    return `${languageLabel(source)} → ${languageLabel(target)}`;
+  }
+
   function friendlyError(payload, fallback = '请求失败') {
     if (!payload) return fallback;
     if (typeof payload === 'string') return payload;
@@ -443,15 +464,17 @@
       if (selected && selected.format_id) options.format_id = String(selected.format_id);
       options.audio_format = 'mp3';
     } else if (mode === 'subtitles') {
-      if (!el.subtitleTargetLanguage || !el.subtitleTargetLanguage.options.length || !el.subtitleTargetLanguage.value) {
-        el.createStatus.textContent = '请选择目标语言';
-        el.createStatus.className = 'live-region error';
-        return;
-      }
       const outputMode = el.subtitleOutputMode?.value || 'translated';
       options.subtitle_output_mode = state.limits.allow_subtitle_translation ? outputMode : 'original';
       options.subtitle_source_language = el.subtitleSourceLanguage?.value || 'auto';
-      options.subtitle_target_language = el.subtitleTargetLanguage.value;
+      if (options.subtitle_output_mode !== 'original') {
+        if (!el.subtitleTargetLanguage || !el.subtitleTargetLanguage.options.length || !el.subtitleTargetLanguage.value) {
+          el.createStatus.textContent = '请选择目标语言';
+          el.createStatus.className = 'live-region error';
+          return;
+        }
+        options.subtitle_target_language = el.subtitleTargetLanguage.value;
+      }
     }
     el.createStatus.textContent = '正在创建任务…';
     el.createStatus.className = 'live-region muted';
@@ -534,7 +557,7 @@
           <span>${escapeHtml(MODE_LABEL[task.mode] || task.mode || '-')}</span>
           ${task.resolution ? `<span>${escapeHtml(task.resolution)}p</span>` : ''}
           ${task.mode === 'subtitles' ? `<span>${escapeHtml(OUTPUT_LABEL[task.subtitle_output_mode] || task.subtitle_output_mode || '字幕')}</span>` : ''}
-          ${task.mode === 'subtitles' && task.subtitle_source_language ? `<span>${escapeHtml(task.subtitle_source_language)} → ${escapeHtml(task.subtitle_target_language || '-')}</span>` : ''}
+          ${task.mode === 'subtitles' && subtitleRouteLabel(task) ? `<span>${escapeHtml(subtitleRouteLabel(task))}</span>` : ''}
           <span>${escapeHtml(formatSize(task.output_size) || '大小未知')}</span>
         </div>
         <div class="progress" aria-hidden="true">${bar}</div>

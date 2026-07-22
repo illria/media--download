@@ -232,7 +232,6 @@ def install(core: Any) -> None:
             "subtitle_output_mode", "subtitle_source_language", "subtitle_target_language",
         ))
         source = str(options.get("subtitle_source_language") or "auto")
-        target = normalize_lang(options.get("subtitle_target_language") or "zh-CN") or "zh-CN"
         if has_new_fields:
             mode = str(options.get("subtitle_output_mode") or "translated").lower()
         else:
@@ -241,9 +240,16 @@ def install(core: Any) -> None:
             mode = "translated" if has_new_fields else "original"
         if source != "auto":
             source = normalize_lang(source) or "auto"
+        # Resolve output mode before target language.  Older original tasks may
+        # contain a stale zh-CN target, but original mode must remain purely
+        # source-only throughout execution and API serialization.
+        if mode == "original":
+            target = ""
+        else:
+            target = normalize_lang(options.get("subtitle_target_language") or "zh-CN") or "zh-CN"
         return {
             "subtitle_source_language": source,
-            "subtitle_target_language": target if target in languages else "zh-CN",
+            "subtitle_target_language": "" if mode == "original" else (target if target in languages else "zh-CN"),
             "subtitle_output_mode": mode,
         }
 
@@ -754,6 +760,7 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_STRUCTURE_FAILED",
                 "message": "翻译结果结构异常，已保留原字幕",
+                "translation_failure_reason": "structure_mismatch",
             }, ensure_ascii=False))
         source_ids = [cue["id"] for cue in source_cues]
         translated_ids = [cue["id"] for cue in translated_cues]
@@ -761,12 +768,14 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_STRUCTURE_FAILED",
                 "message": "翻译结果结构异常，已保留原字幕",
+                "translation_failure_reason": "structure_mismatch",
             }, ensure_ascii=False))
         for source_cue, translated_cue in zip(source_cues, translated_cues):
             if source_cue.get("start") != translated_cue.get("start") or source_cue.get("end") != translated_cue.get("end"):
                 raise RuntimeError(json.dumps({
                     "code": "SUBTITLE_TRANSLATION_STRUCTURE_FAILED",
                     "message": "翻译结果结构异常，已保留原字幕",
+                    "translation_failure_reason": "structure_mismatch",
                 }, ensure_ascii=False))
         texts = [{"text": str(cue.get("translated") or cue.get("text") or "")} for cue in translated_cues]
         # reuse evaluate with translated text
@@ -778,6 +787,7 @@ def install(core: Any) -> None:
                 "message": "翻译质量未达标，已保留原字幕",
                 "detail": report.get("reason"),
                 "translation_quality_metrics": (report.get("metrics") or {}),
+                "translation_failure_reason": report.get("reason") or "quality_failed",
             }, ensure_ascii=False))
         return report
 
@@ -877,6 +887,7 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
                 "failure_stage": "batch_validation",
+                "translation_failure_reason": "batch_id_mismatch",
             }, ensure_ascii=False))
         mapping: dict[str, str] = {}
         for item in items:
@@ -884,6 +895,7 @@ def install(core: Any) -> None:
                 raise RuntimeError(json.dumps({
                     "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
                     "failure_stage": "batch_validation",
+                    "translation_failure_reason": "batch_id_mismatch",
                 }, ensure_ascii=False))
             item_id = str(item.get("id") or "").strip()
             text = str(item.get("text") or "").strip()
@@ -891,22 +903,26 @@ def install(core: Any) -> None:
                 raise RuntimeError(json.dumps({
                     "code": "SUBTITLE_TRANSLATION_EMPTY",
                     "failure_stage": "batch_validation",
+                    "translation_failure_reason": "empty_translation",
                 }, ensure_ascii=False))
             if item_id in mapping:
                 raise RuntimeError(json.dumps({
                     "code": "SUBTITLE_TRANSLATION_ID_MISMATCH",
                     "failure_stage": "batch_validation",
+                    "translation_failure_reason": "batch_id_mismatch",
                 }, ensure_ascii=False))
             metrics = text_metrics(text)
             if metrics["is_emoji_only"] or metrics["is_punct_only"]:
                 raise RuntimeError(json.dumps({
                     "code": "SUBTITLE_TRANSLATION_QUALITY_FAILED",
                     "failure_stage": "batch_validation",
+                    "translation_failure_reason": "emoji_only" if metrics["is_emoji_only"] else "punctuation_only",
                 }, ensure_ascii=False))
             if target_language.startswith("zh") and metrics["has_kana"] and not metrics["has_cjk"]:
                 raise RuntimeError(json.dumps({
                     "code": "SUBTITLE_TRANSLATION_QUALITY_FAILED",
                     "failure_stage": "batch_validation",
+                    "translation_failure_reason": "script_mismatch",
                 }, ensure_ascii=False))
             mapping[item_id] = text
         expected = {cue["id"] for cue in batch}
@@ -914,6 +930,7 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_ID_MISMATCH",
                 "failure_stage": "batch_validation",
+                "translation_failure_reason": "batch_id_mismatch",
             }, ensure_ascii=False))
         return mapping
 
@@ -969,6 +986,7 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
                 "failure_stage": "response_parse",
+                "translation_failure_reason": "response_parse_failed",
             }, ensure_ascii=False)) from exc
         content = ""
         try:
@@ -977,6 +995,7 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
                 "failure_stage": "response_parse",
+                "translation_failure_reason": "response_parse_failed",
             }, ensure_ascii=False)) from exc
         try:
             parsed = extract_json_payload(str(content or ""))
@@ -984,6 +1003,7 @@ def install(core: Any) -> None:
             raise RuntimeError(json.dumps({
                 "code": "SUBTITLE_TRANSLATION_RESPONSE_INVALID",
                 "failure_stage": "response_parse",
+                "translation_failure_reason": "response_parse_failed",
             }, ensure_ascii=False)) from exc
         return validate_translations(batch, parsed, target_language=target_language)
 
@@ -1026,6 +1046,63 @@ def install(core: Any) -> None:
             return "batch_validation"
         return "request"
 
+    TRANSLATION_FAILURE_REASONS = {
+        "not_enough_chinese", "script_mismatch", "emoji_only", "punctuation_only",
+        "duplicate_text", "batch_id_mismatch", "response_parse_failed",
+        "request_timeout", "unauthorized", "rate_limited", "structure_mismatch",
+        "request_failed", "empty_translation", "quality_failed", "kana_in_chinese",
+        "too_few_cues", "average_cue_too_long", "maximum_cue_too_long",
+        "too_little_text", "low_letter_ratio", "single_character", "empty",
+    }
+
+    def classify_translation_failure_reason(error: str, *, stage: str | None = None, metrics: dict[str, Any] | None = None) -> str:
+        """Return a bounded diagnostic enum; never expose provider responses."""
+        parsed: dict[str, Any] = {}
+        try:
+            value = json.loads(str(error or ""))
+            if isinstance(value, dict):
+                parsed = value
+        except Exception:
+            pass
+        detail = str(parsed.get("detail") or error or "").lower()
+        metric_reason = str((metrics or {}).get("reason") or "").strip().lower()
+        explicit_reason = str(parsed.get("translation_failure_reason") or "").strip().lower()
+        if explicit_reason in TRANSLATION_FAILURE_REASONS:
+            return explicit_reason
+        if metric_reason in TRANSLATION_FAILURE_REASONS:
+            return metric_reason
+        if parsed.get("failure_stage") == "response_parse" or "response_invalid" in detail or "jsondecodeerror" in detail:
+            return "response_parse_failed"
+        if "id_mismatch" in detail or "batch_id" in detail:
+            return "batch_id_mismatch"
+        if "emoji" in detail:
+            return "emoji_only"
+        if "punct" in detail:
+            return "punctuation_only"
+        if "duplicate" in detail:
+            return "duplicate_text"
+        if "structure" in detail or "timestamp" in detail or "cue" in detail and "mismatch" in detail:
+            return "structure_mismatch"
+        if "not_enough_chinese" in detail or "chinese" in detail:
+            return "not_enough_chinese"
+        if "script_mismatch" in detail or "language" in detail and "mismatch" in detail:
+            return "script_mismatch"
+        if "timeout" in detail:
+            return "request_timeout"
+        if "unauthorized" in detail or "401" in detail or "403" in detail:
+            return "unauthorized"
+        if "rate_limit" in detail or "429" in detail:
+            return "rate_limited"
+        if stage == "response_parse":
+            return "response_parse_failed"
+        if stage == "structure_gate":
+            return "structure_mismatch"
+        if stage == "full_quality_gate":
+            return "quality_failed"
+        if stage == "batch_validation":
+            return "batch_id_mismatch"
+        return "request_failed"
+
     def translate_cues(task: dict[str, Any], cues: list[dict[str, str]], source_language: str, target_language: str, key: str, source_type: str = "") -> dict[str, Any]:
         stage_rank = {
             None: -1,
@@ -1036,7 +1113,7 @@ def install(core: Any) -> None:
             "full_quality_gate": 4,
         }
 
-        def raise_stage_error(code: str, message: str, *, attempted: bool, quality_checked: bool, stage: str | None, detail: str = "", metrics: dict[str, Any] | None = None) -> None:
+        def raise_stage_error(code: str, message: str, *, attempted: bool, quality_checked: bool, stage: str | None, detail: str = "", metrics: dict[str, Any] | None = None, failure_reason: str | None = None, models_attempted: list[str] | None = None, models_succeeded: list[str] | None = None, model_failures: list[dict[str, str]] | None = None) -> None:
             raise RuntimeError(json.dumps({
                 "code": code,
                 "message": message,
@@ -1046,6 +1123,10 @@ def install(core: Any) -> None:
                 "translation_quality_passed": False,
                 "translation_quality_metrics": metrics or {},
                 "failure_stage": stage,
+                "translation_failure_reason": failure_reason or classify_translation_failure_reason(detail or code, stage=stage, metrics=metrics),
+                "models_attempted": models_attempted or [],
+                "models_succeeded": models_succeeded or [],
+                "model_failures": model_failures or [],
             }, ensure_ascii=False))
 
         if not source_language or source_language in {"auto", "und"}:
@@ -1073,15 +1154,19 @@ def install(core: Any) -> None:
             models = preferred or models
         batches = batch_cues(cues)
         used_models: list[str] = []
+        models_attempted: list[str] = []
+        models_succeeded: list[str] = []
+        model_failures: list[dict[str, str]] = []
         index_map = {cue["id"]: i for i, cue in enumerate(cues)}
         translation_attempted = False
         translation_quality_checked = False
         translation_quality_metrics: dict[str, Any] = {}
         failure_stage: str | None = None
         last_error = "SUBTITLE_TRANSLATION_FAILED"
+        failure_reason: str | None = None
 
         def record_failure(error: str, *, quality_gate_invoked: bool, metrics: dict[str, Any] | None = None) -> None:
-            nonlocal last_error, failure_stage, translation_quality_checked, translation_quality_metrics
+            nonlocal last_error, failure_stage, translation_quality_checked, translation_quality_metrics, failure_reason
             last_error = str(error)
             stage = classify_translation_failure_stage(last_error, quality_gate_invoked=quality_gate_invoked)
             if stage_rank.get(stage, -1) >= stage_rank.get(failure_stage, -1):
@@ -1091,6 +1176,7 @@ def install(core: Any) -> None:
                 translation_quality_checked = True
                 if metrics is not None:
                     translation_quality_metrics = metrics
+            failure_reason = classify_translation_failure_reason(last_error, stage=stage, metrics=metrics)
 
         for model in models:
             candidate = [dict(cue) for cue in cues]
@@ -1102,6 +1188,8 @@ def install(core: Any) -> None:
                 for _attempt in range(2):
                     try:
                         # Mark attempted only immediately before a real model request.
+                        if model not in models_attempted:
+                            models_attempted.append(model)
                         translation_attempted = True
                         mapping = call_translation_model(model, key, source_language, target_language, batch)
                         for cue in batch:
@@ -1115,6 +1203,7 @@ def install(core: Any) -> None:
                     model_ok = False
                     break
             if not model_ok:
+                model_failures.append({"model": model, "stage": failure_stage or "batch_validation", "reason": failure_reason or "request_failed"})
                 continue
             # All batches completed for this model; full output quality gate runs now.
             try:
@@ -1129,9 +1218,12 @@ def install(core: Any) -> None:
                 except Exception:
                     metrics = {}
                 record_failure(str(exc), quality_gate_invoked=True, metrics=metrics)
+                model_failures.append({"model": model, "stage": failure_stage or "full_quality_gate", "reason": failure_reason or "quality_failed"})
                 continue
             if model not in used_models:
                 used_models.append(model)
+            if model not in models_succeeded:
+                models_succeeded.append(model)
             return {
                 "cues": candidate,
                 "models_used": used_models,
@@ -1142,6 +1234,10 @@ def install(core: Any) -> None:
                 "translation_quality_passed": bool(quality and quality.get("passed")),
                 "translation_quality_metrics": (quality or {}).get("metrics") or {},
                 "failure_stage": None,
+                "translation_failure_reason": None,
+                "models_attempted": models_attempted,
+                "models_succeeded": models_succeeded,
+                "model_failures": model_failures,
             }
         if failure_stage == "structure_gate":
             code, message = "SUBTITLE_TRANSLATION_STRUCTURE_FAILED", "翻译结果结构异常，已保留原字幕"
@@ -1165,6 +1261,10 @@ def install(core: Any) -> None:
             stage=failure_stage,
             detail=last_error,
             metrics=translation_quality_metrics,
+            failure_reason=failure_reason,
+            models_attempted=models_attempted,
+            models_succeeded=models_succeeded,
+            model_failures=model_failures,
         )
         raise RuntimeError("unreachable")  # pragma: no cover
 
@@ -1411,10 +1511,16 @@ def install(core: Any) -> None:
         translated_flag = False
         translation_quality = None
         translation_attempted = False
+        translation_requested = False
         translation_quality_checked = False
+        translation_failure_reason: str | None = None
         translation_failure_stage: str | None = None
+        models_attempted: list[str] = []
+        models_succeeded: list[str] = []
+        model_failures: list[dict[str, str]] = []
         platform_target_direct_used = False
         need_translation = mode in {"translated", "bilingual"} and not same_language and not direct_target and not platform_auto_target
+        translation_requested = bool(mode in {"translated", "bilingual"} and not same_language)
         if need_translation and core.is_guest_task(task):
             policy = core.task_policy(task)
             if duration_seconds and duration_seconds > int(policy.get("subtitle_translation_max_duration_minutes", 60)) * 60:
@@ -1449,11 +1555,15 @@ def install(core: Any) -> None:
                             )
                             translated_cues = result["cues"]
                             models_used = list(result.get("models_used") or [])
+                            models_attempted = list(result.get("models_attempted") or [])
+                            models_succeeded = list(result.get("models_succeeded") or [])
+                            model_failures = list(result.get("model_failures") or [])
                             translated_flag = bool(result.get("translated"))
                             translation_quality = result.get("quality")
                             translation_attempted = bool(result.get("translation_attempted"))
                             translation_quality_checked = bool(result.get("translation_quality_checked"))
                             translation_failure_stage = result.get("failure_stage")
+                            translation_failure_reason = result.get("translation_failure_reason")
                             translated_path = work / f"{title}.translated.{target}.srt"
                             write_srt(translated_path, [
                                 {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
@@ -1471,11 +1581,15 @@ def install(core: Any) -> None:
                         )
                         translated_cues = result["cues"]
                         models_used = list(result.get("models_used") or [])
+                        models_attempted = list(result.get("models_attempted") or [])
+                        models_succeeded = list(result.get("models_succeeded") or [])
+                        model_failures = list(result.get("model_failures") or [])
                         translated_flag = bool(result.get("translated"))
                         translation_quality = result.get("quality")
                         translation_attempted = bool(result.get("translation_attempted"))
                         translation_quality_checked = bool(result.get("translation_quality_checked"))
                         translation_failure_stage = result.get("failure_stage")
+                        translation_failure_reason = result.get("translation_failure_reason")
                         translated_path = work / f"{title}.translated.{target}.srt"
                         write_srt(translated_path, [
                             {**cue, "text": cue.get("translated") or cue["text"]} for cue in translated_cues
@@ -1507,13 +1621,31 @@ def install(core: Any) -> None:
                     raise RuntimeError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
                 if code == "SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN":
                     message = "无法确定源语言，已保留原字幕"
+                warning_stage = parsed.get("failure_stage") if isinstance(parsed, dict) else None
+                warning_reason = parsed.get("translation_failure_reason") if isinstance(parsed, dict) else None
+                translation_failure_reason = warning_reason or translation_failure_reason
+                warning_message = {
+                    ("request", None): "翻译服务请求失败，已保留原字幕",
+                    ("response_parse", None): "翻译模型返回格式异常，已保留原字幕",
+                    ("batch_validation", None): "部分字幕翻译结果异常，已保留原字幕",
+                    ("structure_gate", None): "翻译结果结构异常，已保留原字幕",
+                    ("full_quality_gate", "not_enough_chinese"): "翻译结果中文比例不足，已保留原字幕",
+                    ("full_quality_gate", "script_mismatch"): "翻译结果语言不符合目标语言，已保留原字幕",
+                }.get((warning_stage, warning_reason)) or {
+                    "request": "翻译服务请求失败，已保留原字幕",
+                    "response_parse": "翻译模型返回格式异常，已保留原字幕",
+                    "batch_validation": "部分字幕翻译结果异常，已保留原字幕",
+                    "structure_gate": "翻译结果结构异常，已保留原字幕",
+                    "full_quality_gate": "翻译质量未达标，已保留原字幕",
+                }.get(warning_stage or "request", "翻译失败，已保留原字幕")
                 warning = {
                     "code": code if (code.startswith("SUBTITLE_") or code.startswith("SILICONFLOW_") or code.startswith("PLATFORM_")) else "SUBTITLE_TRANSLATION_FAILED",
-                    "message": message if (code.startswith("SUBTITLE_") or code.startswith("SILICONFLOW_") or code.startswith("PLATFORM_")) else "翻译失败，已保留原字幕",
+                    "message": warning_message if warning_stage else (message if (code.startswith("SUBTITLE_") or code.startswith("SILICONFLOW_") or code.startswith("PLATFORM_")) else "翻译失败，已保留原字幕"),
                 }
                 primary = original
                 translated_flag = False
-                models_used = []
+                # Keep model attempts/failures for diagnostics; models_used is
+                # intentionally empty because no final translation was kept.
                 # Propagate stage flags from translate_cues; never infer from error code alone.
                 if isinstance(parsed, dict) and (
                     "translation_attempted" in parsed
@@ -1523,6 +1655,10 @@ def install(core: Any) -> None:
                     translation_attempted = bool(parsed.get("translation_attempted"))
                     translation_quality_checked = bool(parsed.get("translation_quality_checked"))
                     translation_failure_stage = parsed.get("failure_stage")
+                    translation_failure_reason = parsed.get("translation_failure_reason") or translation_failure_reason
+                    models_attempted = list(parsed.get("models_attempted") or models_attempted)
+                    models_succeeded = list(parsed.get("models_succeeded") or models_succeeded)
+                    model_failures = list(parsed.get("model_failures") or model_failures)
                     metrics = parsed.get("translation_quality_metrics") or {}
                     translation_quality = {"passed": False, "metrics": metrics} if translation_quality_checked else None
                 else:
@@ -1530,6 +1666,7 @@ def install(core: Any) -> None:
                     translation_quality_checked = False
                     translation_failure_stage = None
                     translation_quality = None
+                    translation_failure_reason = translation_failure_reason or "request_failed"
             finally:
                 if translation_slot:
                     core.release_guest_translation_slot(task["id"])
@@ -1570,6 +1707,7 @@ def install(core: Any) -> None:
             "translated_cue_count": len(cues) if translated_flag else 0,
             "output_cue_count": len(cues),
             "translated": bool(translated_flag),  # project-model translation only
+            "translation_requested": bool(translation_requested),
             "platform_target_direct_used": bool(platform_target_direct_used),
             "source_type": source_type,
             "platform_original_language": catalog.get("media_language") or "",
@@ -1580,6 +1718,10 @@ def install(core: Any) -> None:
             "translation_quality_checked": bool(translation_quality_checked),
             "translation_quality_passed": bool(translation_quality and translation_quality.get("passed")) if translation_quality_checked else False,
             "translation_failure_stage": translation_failure_stage,
+            "translation_failure_reason": translation_failure_reason,
+            "models_attempted": models_attempted,
+            "models_succeeded": models_succeeded,
+            "model_failures": model_failures,
             "source_quality_metrics": (source_quality or {}).get("metrics") or {},
             "translation_quality_metrics": (translation_quality or {}).get("metrics") or {},
             "timing_estimated": source_type == "sensevoice",

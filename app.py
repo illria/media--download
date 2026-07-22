@@ -165,22 +165,27 @@ def subtitle_options_from_payload(incoming,policy=None,guest=False,probed=None):
         if guest:guest_error('subtitle_source_language_unsupported','不支持的源语言')
         raise HTTPException(400,detail={'code':'SUBTITLE_SOURCE_LANGUAGE_UNSUPPORTED','message':'不支持的源语言'})
     try:
-        target=normalize_subtitle_language(incoming.get('subtitle_target_language'),allow_auto=False,default='zh-CN',required=target_present,field_name='target')
-    except ValueError:
-        if guest:guest_error('subtitle_target_language_unsupported','不支持的目标语言')
-        raise HTTPException(400,detail={'code':'SUBTITLE_TARGET_LANGUAGE_UNSUPPORTED','message':'不支持的目标语言'})
-    try:
         output_mode=normalize_subtitle_output_mode(incoming.get('subtitle_output_mode'),default='translated',required=mode_present)
     except ValueError:
         if guest:guest_error('subtitle_output_mode_unsupported','不支持的字幕输出模式')
         raise HTTPException(400,detail={'code':'SUBTITLE_OUTPUT_MODE_UNSUPPORTED','message':'不支持的字幕输出模式'})
+    # Original subtitles never have a translation target.  Parse the mode
+    # first so legacy tasks carrying a stale zh-CN value remain harmless.
+    if output_mode == 'original':
+        target = ''
+    else:
+        try:
+            target=normalize_subtitle_language(incoming.get('subtitle_target_language'),allow_auto=False,default='zh-CN',required=target_present,field_name='target')
+        except ValueError:
+            if guest:guest_error('subtitle_target_language_unsupported','不支持的目标语言')
+            raise HTTPException(400,detail={'code':'SUBTITLE_TARGET_LANGUAGE_UNSUPPORTED','message':'不支持的目标语言'})
     if guest and not policy.get('allow_subtitle_translation') and output_mode!='original':
         guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
     options={
         'subtitle_source_language':source,
         'subtitle_target_language':target,
         'subtitle_output_mode':output_mode,
-        'subtitle_languages':[source] if source!='auto' else [target,'en','zh-CN','zh','ja','ko'],
+        'subtitle_languages':[source] if source!='auto' else ([target,'en','zh-CN','zh','ja','ko'] if target else ['en','zh-CN','zh','ja','ko']),
     }
     if isinstance(probed,dict):
         try:duration=int(probed.get('duration') or 0)
@@ -340,8 +345,34 @@ def guest_task_expires_at(task):
         expires=finished+timedelta(minutes=int(task_policy(task)['retention_minutes']))
         return expires.isoformat()
     except (TypeError,ValueError,OSError):return None
+def _translation_metadata(task):
+    """Read the task's bounded translation diagnostic sidecar, if present."""
+    candidates=[]
+    output=task.get('output_path') if isinstance(task,dict) else None
+    if output:
+        try:
+            path=Path(output).resolve();base=DL.resolve()
+            if _inside(base,path) and path.is_file():candidates.extend(path.parent.glob('*.translation.json'))
+        except (OSError,RuntimeError):pass
+    task_dir=DL/str(task.get('id') or '')
+    try:
+        if _inside(DL.resolve(),task_dir.resolve()) and task_dir.is_dir():candidates.extend(task_dir.glob('*.translation.json'))
+    except (OSError,RuntimeError):pass
+    def _mtime(path):
+        try:return path.stat().st_mtime
+        except OSError:return 0
+    for path in sorted(set(candidates),key=_mtime,reverse=True):
+        try:
+            value=json.loads(path.read_text(encoding='utf-8'))
+            return value if isinstance(value,dict) else {}
+        except (OSError,ValueError):
+            continue
+    return {}
 def guest_task_view(task):
     options=task.get('options') if isinstance(task.get('options'),dict) else {}
+    mode=options.get('subtitle_output_mode')
+    metadata=_translation_metadata(task) if options.get('mode')=='subtitles' else {}
+    attempted=metadata.get('models_attempted') if isinstance(metadata.get('models_attempted'),list) else []
     return {
         'id':task.get('id'),
         'title':task.get('title'),
@@ -360,10 +391,28 @@ def guest_task_view(task):
         'mode':options.get('mode'),
         'resolution':options.get('resolution'),
         'subtitle_source_language':options.get('subtitle_source_language'),
-        'subtitle_target_language':options.get('subtitle_target_language'),
-        'subtitle_output_mode':options.get('subtitle_output_mode'),
+        'subtitle_target_language':'' if mode=='original' else options.get('subtitle_target_language'),
+        'subtitle_output_mode':mode,
+        'detected_source_language':metadata.get('detected_source_language') or metadata.get('source_language'),
+        'translation_requested':metadata.get('translation_requested',False),
+        'translation_attempted':metadata.get('translation_attempted',False),
+        'translation_quality_checked':metadata.get('translation_quality_checked',False),
+        'translation_quality_passed':metadata.get('translation_quality_passed',False),
+        'translation_failure_stage':metadata.get('translation_failure_stage'),
+        'translation_failure_reason':metadata.get('translation_failure_reason'),
+        'models_attempted_count':len(attempted),
         'download_available':guest_download_available(task),
     }
+def admin_task_view(task):
+    value=dict(task)
+    options=task.get('options') if isinstance(task.get('options'),dict) else {}
+    if options.get('mode')=='subtitles' and options.get('subtitle_output_mode')=='original':
+        options=dict(options);options['subtitle_target_language']='';value['options']=options
+    if options.get('mode')=='subtitles':
+        metadata=_translation_metadata(task)
+        for key in ('translation_requested','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures'):
+            if key in metadata:value[key]=metadata.get(key)
+    return value
 def task_directory_size(path):
     try:return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
     except OSError:return 0
@@ -941,13 +990,13 @@ def tasks(include_koofr:bool=False):
     for i in ids:
         task=row(i)
         if task and include_koofr and task['status'] in {'completed','expired'}:task['koofr']=_koofr_payload(task)
-        if task:output.append(task)
+        if task:output.append(admin_task_view(task))
     return output
 @app.get('/api/admin/tasks/{i}',dependencies=[Depends(auth)])
 def admin_task(i):
     task=row(i)
     if not task:raise HTTPException(404,'任务不存在')
-    return task
+    return admin_task_view(task)
 @app.get('/api/guest/health')
 def guest_health(identity:dict=Depends(guest_identity)):
     policy=guest_policy();free=shutil.disk_usage(ROOT).free
