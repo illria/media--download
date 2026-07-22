@@ -1113,7 +1113,7 @@ def install(core: Any) -> None:
             "full_quality_gate": 4,
         }
 
-        def raise_stage_error(code: str, message: str, *, attempted: bool, quality_checked: bool, stage: str | None, detail: str = "", metrics: dict[str, Any] | None = None, failure_reason: str | None = None, models_attempted: list[str] | None = None, models_succeeded: list[str] | None = None, model_failures: list[dict[str, str]] | None = None) -> None:
+        def raise_stage_error(code: str, message: str, *, attempted: bool, quality_checked: bool, stage: str | None, detail: str = "", metrics: dict[str, Any] | None = None, failure_reason: str | None = None, models_attempted: list[str] | None = None, models_succeeded: list[str] | None = None, model_failures: list[dict[str, Any]] | None = None) -> None:
             raise RuntimeError(json.dumps({
                 "code": code,
                 "message": message,
@@ -1156,7 +1156,7 @@ def install(core: Any) -> None:
         used_models: list[str] = []
         models_attempted: list[str] = []
         models_succeeded: list[str] = []
-        model_failures: list[dict[str, str]] = []
+        model_failures: list[dict[str, Any]] = []
         index_map = {cue["id"]: i for i, cue in enumerate(cues)}
         translation_attempted = False
         translation_quality_checked = False
@@ -1164,16 +1164,11 @@ def install(core: Any) -> None:
         failure_stage: str | None = None
         last_error = "SUBTITLE_TRANSLATION_FAILED"
         failure_reason: str | None = None
-        failure_records: list[dict[str, str]] = []
+        failure_records: list[dict[str, Any]] = []
 
-        def record_failure(error: str, *, quality_gate_invoked: bool, metrics: dict[str, Any] | None = None) -> None:
-            nonlocal last_error, translation_quality_checked, translation_quality_metrics
+        def record_failure(error: str) -> None:
+            nonlocal last_error
             last_error = str(error)
-            if quality_gate_invoked:
-                # Full model output reached assert_translation_quality().
-                translation_quality_checked = True
-                if metrics is not None:
-                    translation_quality_metrics = metrics
 
         for model in models:
             candidate = [dict(cue) for cue in cues]
@@ -1182,7 +1177,6 @@ def install(core: Any) -> None:
             model_failure_reason: str | None = None
             model_quality_checked = False
             model_quality_metrics: dict[str, Any] = {}
-            model_last_error: str | None = None
             for batch_index, batch in enumerate(batches, 1):
                 ensure_not_cancelled(task["id"])
                 core.patch(task["id"], status="processing", progress=45 + batch_index / max(len(batches), 1) * 45, eta=f"正在翻译字幕 {batch_index}/{len(batches)}")
@@ -1199,18 +1193,24 @@ def install(core: Any) -> None:
                         batch_ok = True
                         break
                     except Exception as exc:
-                        model_last_error = str(exc)
-                        stage = classify_translation_failure_stage(model_last_error, quality_gate_invoked=False)
-                        reason = classify_translation_failure_reason(model_last_error, stage=stage)
+                        error_text = str(exc)
+                        stage = classify_translation_failure_stage(error_text, quality_gate_invoked=False)
+                        reason = classify_translation_failure_reason(error_text, stage=stage)
                         if stage_rank.get(stage, -1) >= stage_rank.get(model_failure_stage, -1):
                             model_failure_stage, model_failure_reason = stage, reason
-                        record_failure(model_last_error, quality_gate_invoked=False)
+                        record_failure(error_text)
                         continue
                 if not batch_ok:
                     model_ok = False
                     break
             if not model_ok:
-                failure_records.append({"model": model, "stage": model_failure_stage or "request", "reason": model_failure_reason or "request_failed"})
+                failure_records.append({
+                    "model": model,
+                    "stage": model_failure_stage or "request",
+                    "reason": model_failure_reason or "request_failed",
+                    "quality_checked": False,
+                    "quality_metrics": {},
+                })
                 continue
             # All batches completed for this model; full output quality gate runs now.
             try:
@@ -1224,13 +1224,19 @@ def install(core: Any) -> None:
                         metrics = quality_metrics
                 except Exception:
                     metrics = {}
-                model_last_error = str(exc)
-                model_failure_stage = classify_translation_failure_stage(model_last_error, quality_gate_invoked=True)
-                model_failure_reason = classify_translation_failure_reason(model_last_error, stage=model_failure_stage, metrics=metrics)
+                error_text = str(exc)
+                model_failure_stage = classify_translation_failure_stage(error_text, quality_gate_invoked=True)
+                model_failure_reason = classify_translation_failure_reason(error_text, stage=model_failure_stage, metrics=metrics)
                 model_quality_checked = True
                 model_quality_metrics = metrics
-                record_failure(model_last_error, quality_gate_invoked=True, metrics=metrics)
-                failure_records.append({"model": model, "stage": model_failure_stage or "full_quality_gate", "reason": model_failure_reason or "quality_failed"})
+                record_failure(error_text)
+                failure_records.append({
+                    "model": model,
+                    "stage": model_failure_stage or "full_quality_gate",
+                    "reason": model_failure_reason or "quality_failed",
+                    "quality_checked": model_quality_checked,
+                    "quality_metrics": model_quality_metrics,
+                })
                 continue
             if model not in used_models:
                 used_models.append(model)
@@ -1258,6 +1264,8 @@ def install(core: Any) -> None:
             selected = max(failure_records, key=lambda item: stage_rank.get(item.get("stage"), -1))
             failure_stage = selected.get("stage") or "request"
             failure_reason = selected.get("reason") or "request_failed"
+            translation_quality_checked = bool(selected.get("quality_checked"))
+            translation_quality_metrics = dict(selected.get("quality_metrics") or {})
             model_failures = failure_records
             last_error = f"{failure_stage}:{failure_reason}"
         if failure_stage == "structure_gate":
@@ -1538,7 +1546,7 @@ def install(core: Any) -> None:
         translation_failure_stage: str | None = None
         models_attempted: list[str] = []
         models_succeeded: list[str] = []
-        model_failures: list[dict[str, str]] = []
+        model_failures: list[dict[str, Any]] = []
         platform_target_direct_used = False
         need_translation = mode in {"translated", "bilingual"} and not same_language and not direct_target and not platform_auto_target
         translation_requested = bool(mode in {"translated", "bilingual"} and not same_language)
