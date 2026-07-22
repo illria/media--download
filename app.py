@@ -394,10 +394,15 @@ def guest_task_view(task):
         'subtitle_target_language':'' if mode=='original' else options.get('subtitle_target_language'),
         'subtitle_output_mode':mode,
         'detected_source_language':metadata.get('detected_source_language') or metadata.get('source_language'),
+        'output_language':metadata.get('output_language'),
         'translation_requested':metadata.get('translation_requested',False),
+        'translation_needed':metadata.get('translation_needed',False),
         'translation_attempted':metadata.get('translation_attempted',False),
         'translation_quality_checked':metadata.get('translation_quality_checked',False),
         'translation_quality_passed':metadata.get('translation_quality_passed',False),
+        'asr_target_language_match':metadata.get('asr_target_language_match',False),
+        'asr_target_direct_used':metadata.get('asr_target_direct_used',False),
+        'fallback_to_asr':metadata.get('fallback_to_asr',False),
         'translation_failure_stage':metadata.get('translation_failure_stage'),
         'translation_failure_reason':metadata.get('translation_failure_reason'),
         'models_attempted_count':len(attempted),
@@ -410,7 +415,7 @@ def admin_task_view(task):
         options=dict(options);options['subtitle_target_language']='';value['options']=options
     if options.get('mode')=='subtitles':
         metadata=_translation_metadata(task)
-        for key in ('translation_requested','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures'):
+        for key in ('translation_requested','translation_needed','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures','output_language','asr_target_language_match','asr_target_direct_used','fallback_to_asr'):
             if key in metadata:value[key]=metadata.get(key)
     return value
 def task_directory_size(path):

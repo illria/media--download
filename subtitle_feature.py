@@ -151,6 +151,7 @@ def install(core: Any) -> None:
             "subtitle_source_quality_failed": ("SUBTITLE_SOURCE_QUALITY_FAILED", "平台字幕质量异常，未继续翻译。"),
             "subtitle_source_language_uncertain": ("SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN", "无法可靠识别源语言，未继续翻译。"),
             "asr_quality_failed": ("ASR_QUALITY_FAILED", "语音识别结果质量过低，未生成字幕。"),
+            "asr_source_language_uncertain": ("ASR_SOURCE_LANGUAGE_UNCERTAIN", "无法确定语种，已提供 AI 识别字幕。"),
             "subtitle_parse_failed": ("SUBTITLE_PARSE_FAILED", "字幕解析失败。"),
             "subtitle_source_not_found": ("SUBTITLE_SOURCE_NOT_FOUND", "没有找到可用源字幕。"),
             "transcription_empty": ("TRANSCRIPTION_EMPTY", "语音识别没有返回有效文字。"),
@@ -744,6 +745,59 @@ def install(core: Any) -> None:
         elif role == "translation" and expected_language.startswith("zh") and kana_ratio > 0.15:
             failed, reason = True, "kana_in_chinese"
         return {"passed": not failed, "reason": reason, "metrics": metrics}
+
+    def detect_asr_language(text: str, provider_language: str | None = None) -> str:
+        """Detect only languages whose writing system is unambiguous.
+
+        Latin-script ASR remains ``und`` unless the provider supplied a
+        supported language.  This deliberately avoids guessing from titles,
+        URLs, filenames, or the requested target language.
+        """
+        provider = normalize_lang(provider_language)
+        if provider in languages:
+            return provider
+        value = str(text or "")
+        counts = {
+            "han": sum(1 for char in value if "一" <= char <= "鿿"),
+            "kana": sum(1 for char in value if "ぁ" <= char <= "ヿ"),
+            "hangul": sum(1 for char in value if "가" <= char <= "힣"),
+            "bengali": sum(1 for char in value if "ঀ" <= char <= "৿"),
+            "arabic": sum(1 for char in value if "؀" <= char <= "ۿ"),
+            "cyrillic": sum(1 for char in value if "Ѐ" <= char <= "ӿ"),
+            "latin": sum(1 for char in value if ("a" <= char.lower() <= "z")),
+        }
+        script_total = sum(counts.values())
+        if script_total < 8:
+            return "und"
+        # Japanese needs a visible kana signal; Han-only text is treated as
+        # Chinese rather than guessing Japanese from shared Han characters.
+        if counts["kana"] >= 3 and counts["kana"] / script_total >= 0.12:
+            return "ja"
+        if counts["hangul"] / script_total >= 0.45:
+            return "ko"
+        if counts["bengali"] / script_total >= 0.45:
+            return "bn"
+        if counts["arabic"] / script_total >= 0.45:
+            return "ar"
+        if counts["cyrillic"] / script_total >= 0.45:
+            return "ru"
+        if counts["han"] >= 8 and counts["han"] / script_total >= 0.45:
+            return "zh-CN"
+        return "und"
+
+    def asr_matches_target_language(cues: list[dict[str, str]], target_language: str) -> bool:
+        """Require a quality-passing, whole-ASR writing-system match."""
+        target = normalize_lang(target_language)
+        if target not in languages:
+            return False
+        quality = evaluate_cues_quality(cues, role="source")
+        if not quality.get("passed"):
+            return False
+        text = "\n".join(str(cue.get("text") or "") for cue in cues)
+        detected = detect_asr_language(text)
+        if target.startswith("zh"):
+            return detected == "zh-CN"
+        return detected == target
 
     def assert_source_quality(cues: list[dict[str, str]], video_duration: float = 0.0, language: str = "") -> dict[str, Any]:
         report = evaluate_cues_quality(cues, video_duration=video_duration, expected_language=language, role="source")
@@ -1344,7 +1398,7 @@ def install(core: Any) -> None:
             raise RuntimeError("没有生成转写音频分段")
         return chunks
 
-    def transcribe(path: Path, key: str) -> str:
+    def transcribe(path: Path, key: str) -> dict[str, str | None]:
         with path.open("rb") as audio:
             response = requests.post(
                 ASR_ENDPOINT,
@@ -1358,7 +1412,11 @@ def install(core: Any) -> None:
             raise RuntimeError("SILICONFLOW_RATE_LIMITED")
         if not response.ok:
             raise RuntimeError(f"硅基流动转写失败 HTTP {response.status_code}: {response.text[:300]}")
-        text = str(response.json().get("text") or "").strip()
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("TRANSCRIPTION_RESPONSE_INVALID") from exc
+        text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
         if not text:
             raise RuntimeError("TRANSCRIPTION_EMPTY")
         metrics = text_metrics(text)
@@ -1367,7 +1425,14 @@ def install(core: Any) -> None:
                 "code": "ASR_QUALITY_FAILED",
                 "message": "语音识别结果质量过低，未生成字幕。",
             }, ensure_ascii=False))
-        return text
+        provider_language = None
+        if isinstance(payload, dict):
+            for field in ("language", "detected_language", "lang"):
+                candidate = payload.get(field)
+                if isinstance(candidate, str) and candidate.strip():
+                    provider_language = candidate.strip()
+                    break
+        return {"text": text, "provider_language": provider_language}
 
     def srt_time(seconds: float) -> str:
         ms = max(0, round(seconds * 1000))
@@ -1390,12 +1455,19 @@ def install(core: Any) -> None:
                 output.append(item)
         return output
 
-    def create_asr_srt(task: dict[str, Any], work: Path, chunks: list[Path], total: float, key: str) -> Path:
+    def create_asr_srt(task: dict[str, Any], work: Path, chunks: list[Path], total: float, key: str) -> tuple[Path, str]:
         cues: list[dict[str, str]] = []
+        transcript_parts: list[str] = []
+        provider_languages: list[str] = []
         for index, chunk in enumerate(chunks):
             ensure_not_cancelled(task["id"])
             core.patch(task["id"], status="processing", progress=20 + index / max(len(chunks), 1) * 20, eta=f"平台没有可用字幕，正在尝试 AI 识别 {index + 1}/{len(chunks)}")
-            text = transcribe(chunk, key)
+            result = transcribe(chunk, key)
+            text = str(result.get("text") or "")
+            provider_language = result.get("provider_language")
+            if provider_language:
+                provider_languages.append(provider_language)
+            transcript_parts.append(text)
             chunk_start = index * 60.0
             chunk_end = min(total, chunk_start + duration(chunk))
             parts = pieces(text)
@@ -1445,9 +1517,13 @@ def install(core: Any) -> None:
                 "message": "语音识别结果质量过低，未生成字幕。",
                 "detail": quality.get("reason") or "long_cues",
             }, ensure_ascii=False))
-        path = work / f"{safe_name(task.get('title'))}.original.auto.srt"
+        detected_language = detect_asr_language(
+            "\n".join(transcript_parts),
+            provider_languages[0] if provider_languages else None,
+        )
+        path = work / f"{safe_name(task.get('title'))}.recognized.{detected_language}.srt"
         write_srt(path, cues)
-        return path
+        return path, detected_language
 
     def finish(task: dict[str, Any], primary: Path, files: list[Path], warning: dict[str, str] | None = None) -> None:
         ensure_not_cancelled(task["id"])
@@ -1495,7 +1571,25 @@ def install(core: Any) -> None:
             duration_seconds = float((task.get("options") or {}).get("media_duration_seconds") or 0)
         except (TypeError, ValueError):
             duration_seconds = 0.0
-        same_language = bool(source_language and source_language not in {"auto", "und"} and normalize_lang(source_language) == target)
+        known_source_matches_target = bool(
+            source_language
+            and source_language not in {"auto", "und"}
+            and target
+            and normalize_lang(source_language) == target
+        )
+        asr_target_language_match = bool(
+            source_type == "sensevoice"
+            and mode in {"translated", "bilingual"}
+            and (known_source_matches_target or asr_matches_target_language(cues, target))
+        )
+        if source_type == "sensevoice" and source_language in {"auto", "und", ""}:
+            detected_asr_language = detect_asr_language("\n".join(str(cue.get("text") or "") for cue in cues))
+            if detected_asr_language != "und":
+                source_language = detected_asr_language
+                known_source_matches_target = bool(target and normalize_lang(source_language) == target)
+        same_language = bool(known_source_matches_target or asr_target_language_match)
+        asr_target_direct_used = bool(asr_target_language_match)
+        asr_language_uncertain = bool(source_type == "sensevoice" and source_language in {"auto", "und", ""})
         direct_target = source_type == "platform_target_manual"
         platform_auto_target = source_type == "platform_auto_translated_target"
         source_quality = evaluate_cues_quality(
@@ -1531,7 +1625,11 @@ def install(core: Any) -> None:
                 "message": "平台字幕质量异常，未继续翻译。",
                 "detail": source_quality.get("reason"),
             }, ensure_ascii=False))
-        original = work / f"{title}.original.{source_language or 'und'}.srt"
+        if source_type == "sensevoice":
+            recognized_language = target if asr_target_direct_used else (source_language or "und")
+            original = work / f"{title}.recognized.{recognized_language}.srt"
+        else:
+            original = work / f"{title}.original.{source_language or 'und'}.srt"
         write_srt(original, cues)
         files = [original]
         primary = original
@@ -1548,8 +1646,19 @@ def install(core: Any) -> None:
         models_succeeded: list[str] = []
         model_failures: list[dict[str, Any]] = []
         platform_target_direct_used = False
-        need_translation = mode in {"translated", "bilingual"} and not same_language and not direct_target and not platform_auto_target
+        need_translation = (
+            mode in {"translated", "bilingual"}
+            and not same_language
+            and not asr_language_uncertain
+            and not direct_target
+            and not platform_auto_target
+        )
         translation_requested = bool(mode in {"translated", "bilingual"} and not same_language)
+        if asr_language_uncertain and mode in {"translated", "bilingual"}:
+            warning = {
+                "code": "ASR_SOURCE_LANGUAGE_UNCERTAIN",
+                "message": "无法确定语种，已提供 AI 识别字幕",
+            }
         if need_translation and core.is_guest_task(task):
             policy = core.task_policy(task)
             if duration_seconds and duration_seconds > int(policy.get("subtitle_translation_max_duration_minutes", 60)) * 60:
@@ -1728,6 +1837,7 @@ def install(core: Any) -> None:
         meta = {
             "source_language": source_language or "und",
             "target_language": target,
+            "output_language": target if (translated_flag or asr_target_direct_used or platform_target_direct_used or platform_auto_target) else (source_language or "und"),
             "output_mode": mode,
             "primary_model": (models_used[0] if models_used else None),
             "models_used": models_used,
@@ -1737,6 +1847,9 @@ def install(core: Any) -> None:
             "output_cue_count": len(cues),
             "translated": bool(translated_flag),  # project-model translation only
             "translation_requested": bool(translation_requested),
+            "translation_needed": bool(need_translation),
+            "asr_target_language_match": bool(asr_target_language_match),
+            "asr_target_direct_used": bool(asr_target_direct_used),
             "platform_target_direct_used": bool(platform_target_direct_used),
             "source_type": source_type,
             "platform_original_language": catalog.get("media_language") or "",
@@ -1756,7 +1869,8 @@ def install(core: Any) -> None:
             "timing_estimated": source_type == "sensevoice",
             "quality_warning": bool((source_quality and not source_quality.get("passed")) or platform_auto_target),
             "translation_skipped_same_language": bool(same_language and mode != "original"),
-            "fallback_to_original": bool(warning is not None and primary == original),
+            "fallback_to_original": bool(warning is not None and primary == original and source_type != "sensevoice"),
+            "fallback_to_asr": bool(warning and warning.get("code") == "ASR_SOURCE_LANGUAGE_UNCERTAIN"),
             "fallback_to_platform_auto_translation": bool(platform_auto_target),
             "fallback_reason": (warning or {}).get("code"),
             "available_manual_subtitles": catalog.get("manual") or [],
@@ -1879,9 +1993,8 @@ def install(core: Any) -> None:
                 total = duration(audio)
                 core.patch(task_id, status="processing", progress=30, eta="正在准备 AI 识别音频")
                 chunks = make_chunks(task, audio, work, total)
-                source_path = create_asr_srt(task, work, chunks, total, key)
+                source_path, source_language = create_asr_srt(task, work, chunks, total, key)
                 source_type = "sensevoice"
-                source_language = media_language or "und"
             else:
                 source_language = normalize_lang(source_meta.get("language") if source_meta else media_language or "und") or "und"
                 key = get_key()

@@ -46,6 +46,7 @@
     GUEST_TRANSLATION_BUSY: '字幕翻译正在处理中，请稍后重试。',
     GUEST_TRANSLATION_DURATION_LIMIT: '该视频超过游客字幕翻译时长限制。',
     ASR_QUALITY_FAILED: '语音识别结果质量过低，未生成字幕。',
+    ASR_SOURCE_LANGUAGE_UNCERTAIN: '无法确定语种，已提供 AI 识别字幕。',
     SUBTITLE_SOURCE_QUALITY_FAILED: '平台字幕质量异常，未继续翻译。',
     SUBTITLE_TRANSLATION_QUALITY_FAILED: '翻译质量未达标，已保留原字幕。',
     SUBTITLE_TRANSLATION_STRUCTURE_FAILED: '翻译结果结构异常，已保留原字幕。',
@@ -172,9 +173,18 @@
 
   function subtitleRouteLabel(task) {
     if (task.subtitle_output_mode === 'original') return '';
+    if (task.asr_target_direct_used) {
+      return `AI 识别 · ${languageLabel(task.output_language || task.subtitle_target_language || 'zh-CN')}`;
+    }
+    if (task.fallback_to_asr) return 'AI 识别字幕 · 语种未确定';
     const source = task.detected_source_language || task.subtitle_source_language || 'auto';
     const target = task.subtitle_target_language || 'zh-CN';
     return `${languageLabel(source)} → ${languageLabel(target)}`;
+  }
+
+  function subtitleOutputLabel(task) {
+    if (task.fallback_to_asr) return 'AI 识别字幕';
+    return OUTPUT_LABEL[task.subtitle_output_mode] || task.subtitle_output_mode || '字幕';
   }
 
   function friendlyError(payload, fallback = '请求失败') {
@@ -556,7 +566,7 @@
           <span>${escapeHtml(task.platform || '-')}</span>
           <span>${escapeHtml(MODE_LABEL[task.mode] || task.mode || '-')}</span>
           ${task.resolution ? `<span>${escapeHtml(task.resolution)}p</span>` : ''}
-          ${task.mode === 'subtitles' ? `<span>${escapeHtml(OUTPUT_LABEL[task.subtitle_output_mode] || task.subtitle_output_mode || '字幕')}</span>` : ''}
+          ${task.mode === 'subtitles' ? `<span>${escapeHtml(subtitleOutputLabel(task))}</span>` : ''}
           ${task.mode === 'subtitles' && subtitleRouteLabel(task) ? `<span>${escapeHtml(subtitleRouteLabel(task))}</span>` : ''}
           <span>${escapeHtml(formatSize(task.output_size) || '大小未知')}</span>
         </div>
