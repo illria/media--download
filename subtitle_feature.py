@@ -152,9 +152,14 @@ def install(core: Any) -> None:
             "subtitle_source_language_uncertain": ("SUBTITLE_SOURCE_LANGUAGE_UNCERTAIN", "无法可靠识别源语言，未继续翻译。"),
             "asr_quality_failed": ("ASR_QUALITY_FAILED", "语音识别结果质量过低，未生成字幕。"),
             "asr_source_language_uncertain": ("ASR_SOURCE_LANGUAGE_UNCERTAIN", "无法确定语种，已提供 AI 识别字幕。"),
+            "asr_request_failed": ("ASR_REQUEST_FAILED", "AI 语音识别服务请求失败，请稍后重试。"),
+            "asr_request_timeout": ("ASR_REQUEST_TIMEOUT", "AI 语音识别服务请求失败，请稍后重试。"),
+            "asr_response_invalid": ("ASR_RESPONSE_INVALID", "AI 语音识别服务返回异常，请稍后重试。"),
+            "asr_no_speech": ("ASR_NO_SPEECH", "未识别到有效语音，无法生成字幕。"),
             "subtitle_parse_failed": ("SUBTITLE_PARSE_FAILED", "字幕解析失败。"),
             "subtitle_source_not_found": ("SUBTITLE_SOURCE_NOT_FOUND", "没有找到可用源字幕。"),
-            "transcription_empty": ("TRANSCRIPTION_EMPTY", "语音识别没有返回有效文字。"),
+            "transcription_empty": ("ASR_NO_SPEECH", "未识别到有效语音，无法生成字幕。"),
+            "transcription_response_invalid": ("ASR_RESPONSE_INVALID", "AI 语音识别服务返回异常，请稍后重试。"),
         }
         for key, value in mapping.items():
             if key in lower:
@@ -1352,15 +1357,29 @@ def install(core: Any) -> None:
         raise RuntimeError("unreachable")  # pragma: no cover
 
     def download_audio(task: dict[str, Any], work: Path, cookie: Path | None) -> Path:
+        options = task.get("options") if isinstance(task.get("options"), dict) else {}
+        format_id = str(options.get("asr_audio_format_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", format_id or ""):
+            format_id = ""
+        audio_format = format_id or "bestaudio/best"
         command = core.task_base(task, cookie, False) + [
-            "--format", "bestaudio/best", "--output", str(work / "source.%(ext)s"), task["url"],
+            "--format", audio_format, "--output", str(work / "source.%(ext)s"), task["url"],
         ]
         if core.is_guest_task(task):
             command[1:1] = ["--max-filesize", f"{core.task_policy(task)['max_file_size_gb']}G"]
         result = run_task(task, work, command, 900)
         if result.returncode:
-            code, message = friendly_error(result.stderr or result.stdout, task["url"])
-            raise RuntimeError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
+            # Prefer probe-selected format; if it is unavailable, fall back once to bestaudio.
+            if format_id and "requested format is not available" in (result.stderr or result.stdout or "").lower():
+                fallback = core.task_base(task, cookie, False) + [
+                    "--format", "bestaudio/best", "--output", str(work / "source.%(ext)s"), task["url"],
+                ]
+                if core.is_guest_task(task):
+                    fallback[1:1] = ["--max-filesize", f"{core.task_policy(task)['max_file_size_gb']}G"]
+                result = run_task(task, work, fallback, 900)
+            if result.returncode:
+                code, message = friendly_error(result.stderr or result.stdout, task["url"])
+                raise RuntimeError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
         files = [path for path in work.glob("source.*") if path.is_file() and path.suffix != ".part"]
         if not files:
             raise RuntimeError("没有找到下载后的音频文件")
@@ -1398,41 +1417,143 @@ def install(core: Any) -> None:
             raise RuntimeError("没有生成转写音频分段")
         return chunks
 
-    def transcribe(path: Path, key: str) -> dict[str, str | None]:
-        with path.open("rb") as audio:
-            response = requests.post(
-                ASR_ENDPOINT,
-                headers={"Authorization": f"Bearer {key}"},
-                files={"file": (path.name, audio, "audio/mpeg"), "model": (None, ASR_MODEL)},
-                timeout=(20, 240),
-            )
-        if response.status_code in {401, 403}:
-            raise RuntimeError("SILICONFLOW_UNAUTHORIZED")
-        if response.status_code == 429:
-            raise RuntimeError("SILICONFLOW_RATE_LIMITED")
-        if not response.ok:
-            raise RuntimeError(f"硅基流动转写失败 HTTP {response.status_code}: {response.text[:300]}")
+    def _asr_request_error(code: str, message: str, chunk_index: int, total_chunks: int, stage: str = "request") -> RuntimeError:
+        return RuntimeError(json.dumps({
+            "code": code,
+            "message": message,
+            "asr_failure_stage": stage,
+            "asr_failed_chunk": chunk_index + 1,
+            "asr_total_chunks": total_chunks,
+        }, ensure_ascii=False))
+
+    def _retry_after_seconds(response: requests.Response, fallback: float) -> float:
+        raw = response.headers.get("Retry-After") if response is not None else None
+        if not raw:
+            return fallback
         try:
-            payload = response.json()
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("TRANSCRIPTION_RESPONSE_INVALID") from exc
-        text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
-        if not text:
-            raise RuntimeError("TRANSCRIPTION_EMPTY")
-        metrics = text_metrics(text)
-        if metrics["is_emoji_only"] or metrics["is_punct_only"] or metrics["letter_ratio"] < 0.2:
-            raise RuntimeError(json.dumps({
-                "code": "ASR_QUALITY_FAILED",
-                "message": "语音识别结果质量过低，未生成字幕。",
-            }, ensure_ascii=False))
-        provider_language = None
-        if isinstance(payload, dict):
+            return min(max(float(raw), 1.0), 30.0)
+        except (TypeError, ValueError):
+            return fallback
+
+    def transcribe(path: Path, key: str, chunk_index: int = 0, total_chunks: int = 1) -> dict[str, Any]:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            response = None
+            try:
+                with path.open("rb") as audio:
+                    response = requests.post(
+                        ASR_ENDPOINT,
+                        headers={"Authorization": f"Bearer {key}"},
+                        files={"file": (path.name, audio, "audio/mpeg"), "model": (None, ASR_MODEL)},
+                        timeout=(20, 240),
+                    )
+            except requests.Timeout as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise _asr_request_error(
+                    "ASR_REQUEST_TIMEOUT",
+                    "AI 语音识别服务请求失败，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="request",
+                ) from exc
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise _asr_request_error(
+                    "ASR_REQUEST_FAILED",
+                    "AI 语音识别服务请求失败，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="request",
+                ) from exc
+
+            if response.status_code in {401, 403}:
+                raise RuntimeError(json.dumps({
+                    "code": "SILICONFLOW_UNAUTHORIZED",
+                    "message": "硅基流动 API Key 无效或没有权限。",
+                    "asr_failure_stage": "auth",
+                    "asr_failed_chunk": chunk_index + 1,
+                    "asr_total_chunks": total_chunks,
+                }, ensure_ascii=False))
+            if response.status_code == 429:
+                if attempt < 2:
+                    time.sleep(_retry_after_seconds(response, float(2 ** attempt)))
+                    continue
+                raise _asr_request_error(
+                    "ASR_REQUEST_FAILED",
+                    "AI 语音识别服务请求失败，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="request",
+                )
+            if response.status_code in {500, 502, 503, 504}:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise _asr_request_error(
+                    "ASR_REQUEST_FAILED",
+                    "AI 语音识别服务请求失败，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="request",
+                )
+            if not response.ok:
+                raise _asr_request_error(
+                    "ASR_REQUEST_FAILED",
+                    "AI 语音识别服务请求失败，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="request",
+                )
+            try:
+                payload = response.json()
+            except (TypeError, ValueError) as exc:
+                raise _asr_request_error(
+                    "ASR_RESPONSE_INVALID",
+                    "AI 语音识别服务返回异常，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="response",
+                ) from exc
+            if not isinstance(payload, dict):
+                raise _asr_request_error(
+                    "ASR_RESPONSE_INVALID",
+                    "AI 语音识别服务返回异常，请稍后重试。",
+                    chunk_index,
+                    total_chunks,
+                    stage="response",
+                )
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                # Valid provider response with empty text = silent / no-speech chunk.
+                return {"text": "", "provider_language": None, "no_speech": True}
+            metrics = text_metrics(text)
+            if metrics["is_emoji_only"] or metrics["is_punct_only"] or metrics["letter_ratio"] < 0.2:
+                raise RuntimeError(json.dumps({
+                    "code": "ASR_QUALITY_FAILED",
+                    "message": "语音识别结果质量过低，未生成字幕。",
+                    "asr_failed_chunk": chunk_index + 1,
+                    "asr_total_chunks": total_chunks,
+                }, ensure_ascii=False))
+            provider_language = None
             for field in ("language", "detected_language", "lang"):
                 candidate = payload.get(field)
                 if isinstance(candidate, str) and candidate.strip():
                     provider_language = candidate.strip()
                     break
-        return {"text": text, "provider_language": provider_language}
+            return {"text": text, "provider_language": provider_language, "no_speech": False}
+        raise _asr_request_error(
+            "ASR_REQUEST_FAILED",
+            "AI 语音识别服务请求失败，请稍后重试。",
+            chunk_index,
+            total_chunks,
+            stage="request",
+        ) from last_exc
 
     def srt_time(seconds: float) -> str:
         ms = max(0, round(seconds * 1000))
@@ -1455,15 +1576,36 @@ def install(core: Any) -> None:
                 output.append(item)
         return output
 
-    def create_asr_srt(task: dict[str, Any], work: Path, chunks: list[Path], total: float, key: str) -> tuple[Path, str]:
+    def create_asr_srt(task: dict[str, Any], work: Path, chunks: list[Path], total: float, key: str) -> tuple[Path, str, dict[str, Any]]:
         cues: list[dict[str, str]] = []
         transcript_parts: list[str] = []
         provider_languages: list[str] = []
+        total_chunks = max(len(chunks), 1)
+        skipped_chunks: list[int] = []
+        skip_reasons: dict[str, str] = {}
+        completed_chunks = 0
         for index, chunk in enumerate(chunks):
             ensure_not_cancelled(task["id"])
-            core.patch(task["id"], status="processing", progress=20 + index / max(len(chunks), 1) * 20, eta=f"平台没有可用字幕，正在尝试 AI 识别 {index + 1}/{len(chunks)}")
-            result = transcribe(chunk, key)
-            text = str(result.get("text") or "")
+            core.patch(
+                task["id"],
+                status="processing",
+                progress=20 + index / total_chunks * 20,
+                eta=f"正在识别第 {index + 1}/{len(chunks)} 段",
+            )
+            result = transcribe(chunk, key, chunk_index=index, total_chunks=len(chunks))
+            text = str(result.get("text") or "").strip()
+            no_speech = bool(result.get("no_speech")) or not text
+            if no_speech:
+                skipped_chunks.append(index + 1)
+                skip_reasons[str(index + 1)] = "no_speech"
+                completed_chunks += 1
+                core.patch(
+                    task["id"],
+                    status="processing",
+                    progress=20 + completed_chunks / total_chunks * 20,
+                    eta=f"正在识别第 {index + 1}/{len(chunks)} 段",
+                )
+                continue
             provider_language = result.get("provider_language")
             if provider_language:
                 provider_languages.append(provider_language)
@@ -1472,15 +1614,24 @@ def install(core: Any) -> None:
             chunk_end = min(total, chunk_start + duration(chunk))
             parts = pieces(text)
             if not parts:
-                raise RuntimeError(json.dumps({
-                    "code": "ASR_QUALITY_FAILED",
-                    "message": "语音识别结果质量过低，未生成字幕。",
-                }, ensure_ascii=False))
+                # Empty after split still counts as no usable speech for this chunk.
+                skipped_chunks.append(index + 1)
+                skip_reasons[str(index + 1)] = "no_speech"
+                completed_chunks += 1
+                core.patch(
+                    task["id"],
+                    status="processing",
+                    progress=20 + completed_chunks / total_chunks * 20,
+                    eta=f"正在识别第 {index + 1}/{len(chunks)} 段",
+                )
+                continue
             metrics = text_metrics(text)
             if metrics["is_emoji_only"] or metrics["is_punct_only"] or metrics["letter_ratio"] < 0.18:
                 raise RuntimeError(json.dumps({
                     "code": "ASR_QUALITY_FAILED",
                     "message": "语音识别结果质量过低，未生成字幕。",
+                    "asr_failed_chunk": index + 1,
+                    "asr_total_chunks": len(chunks),
                 }, ensure_ascii=False))
             span = max(chunk_end - chunk_start, 0.1)
             max_cues = max(1, int(span // 2))
@@ -1510,12 +1661,33 @@ def install(core: Any) -> None:
                     "text": part,
                 })
                 cursor = cue_end
+            completed_chunks += 1
+            core.patch(
+                task["id"],
+                status="processing",
+                progress=20 + completed_chunks / total_chunks * 20,
+                eta=f"正在识别第 {index + 1}/{len(chunks)} 段",
+            )
+        asr_stats = {
+            "asr_total_chunks": len(chunks),
+            "asr_completed_chunks": len(chunks) - len(skipped_chunks),
+            "asr_skipped_chunks": skipped_chunks,
+            "asr_skip_reasons": skip_reasons,
+        }
+        if not cues:
+            raise RuntimeError(json.dumps({
+                "code": "ASR_NO_SPEECH",
+                "message": "未识别到有效语音，无法生成字幕。",
+                **asr_stats,
+            }, ensure_ascii=False))
+        core.patch(task["id"], status="processing", progress=40, eta="正在整理 AI 识别字幕")
         quality = evaluate_cues_quality(cues, video_duration=total, role="source")
         if not quality["passed"] or any(cue_duration_seconds(cue) > 10.5 for cue in cues):
             raise RuntimeError(json.dumps({
                 "code": "ASR_QUALITY_FAILED",
                 "message": "语音识别结果质量过低，未生成字幕。",
                 "detail": quality.get("reason") or "long_cues",
+                **asr_stats,
             }, ensure_ascii=False))
         detected_language = detect_asr_language(
             "\n".join(transcript_parts),
@@ -1523,7 +1695,7 @@ def install(core: Any) -> None:
         )
         path = work / f"{safe_name(task.get('title'))}.recognized.{detected_language}.srt"
         write_srt(path, cues)
-        return path, detected_language
+        return path, detected_language, asr_stats
 
     def finish(task: dict[str, Any], primary: Path, files: list[Path], warning: dict[str, str] | None = None) -> None:
         ensure_not_cancelled(task["id"])
@@ -1560,7 +1732,7 @@ def install(core: Any) -> None:
         if auto_save and not core.is_guest_task(task):
             auto_save(task["id"])
 
-    def build_outputs(task: dict[str, Any], work: Path, source_path: Path, source_language: str, source_type: str, key: str | None, catalog: dict[str, Any] | None = None) -> tuple[Path, list[Path], dict[str, str] | None]:
+    def build_outputs(task: dict[str, Any], work: Path, source_path: Path, source_language: str, source_type: str, key: str | None, catalog: dict[str, Any] | None = None, asr_stats: dict[str, Any] | None = None) -> tuple[Path, list[Path], dict[str, str] | None]:
         opts = task_subtitle_options(task)
         target = opts["subtitle_target_language"]
         mode = opts["subtitle_output_mode"]
@@ -1571,6 +1743,7 @@ def install(core: Any) -> None:
             duration_seconds = float((task.get("options") or {}).get("media_duration_seconds") or 0)
         except (TypeError, ValueError):
             duration_seconds = 0.0
+        asr_stats = asr_stats if isinstance(asr_stats, dict) else {}
         known_source_matches_target = bool(
             source_language
             and source_language not in {"auto", "und"}
@@ -1876,6 +2049,11 @@ def install(core: Any) -> None:
             "available_manual_subtitles": catalog.get("manual") or [],
             "available_auto_subtitles": catalog.get("auto") or [],
         }
+        if source_type == "sensevoice" and asr_stats:
+            meta["asr_total_chunks"] = asr_stats.get("asr_total_chunks")
+            meta["asr_completed_chunks"] = asr_stats.get("asr_completed_chunks")
+            meta["asr_skipped_chunks"] = asr_stats.get("asr_skipped_chunks") or []
+            meta["asr_skip_reasons"] = asr_stats.get("asr_skip_reasons") or {}
         meta_path = work / f"{title}.translation.json"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         # Always keep metadata for all subtitle modes, including original.
@@ -1982,6 +2160,7 @@ def install(core: Any) -> None:
                             source_type = "platform_auto" if source_meta.get("auto") else "platform_manual"
                 if source_meta:
                     source_path = source_meta["path"]
+            asr_stats: dict[str, Any] | None = None
             if source_path is None:
                 key = get_key()
                 if not key:
@@ -1989,35 +2168,62 @@ def install(core: Any) -> None:
                 if core.is_guest_task(task):
                     ai_slot = core.start_guest_ai(task)
                 core.patch(task_id, status="downloading", progress=15, eta="平台没有可用字幕，正在尝试 AI 识别")
-                audio = download_audio(task, work, cookie)
+                try:
+                    audio = download_audio(task, work, cookie)
+                except Exception as audio_exc:
+                    # Mark audio download stage so guest errors keep media-link wording.
+                    try:
+                        parsed_audio = json.loads(str(audio_exc))
+                        if isinstance(parsed_audio, dict):
+                            parsed_audio.setdefault("asr_failure_stage", "audio_download")
+                            raise RuntimeError(json.dumps(parsed_audio, ensure_ascii=False)) from audio_exc
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    raise RuntimeError(json.dumps({
+                        "code": "DOWNLOAD_FAILED",
+                        "message": "无法下载媒体音频，请确认链接为公开可访问的媒体。",
+                        "asr_failure_stage": "audio_download",
+                    }, ensure_ascii=False)) from audio_exc
                 total = duration(audio)
-                core.patch(task_id, status="processing", progress=30, eta="正在准备 AI 识别音频")
+                core.patch(task_id, status="processing", progress=18, eta="正在准备 AI 识别音频")
                 chunks = make_chunks(task, audio, work, total)
-                source_path, source_language = create_asr_srt(task, work, chunks, total, key)
+                source_path, source_language, asr_stats = create_asr_srt(task, work, chunks, total, key)
                 source_type = "sensevoice"
             else:
                 source_language = normalize_lang(source_meta.get("language") if source_meta else media_language or "und") or "und"
                 key = get_key()
             # All platform sources go through build_outputs for quality/metadata consistency.
             primary, files, warning = build_outputs(
-                task, work, source_path, source_language if source_path else "auto", source_type, get_key(), catalog=catalog
+                task, work, source_path, source_language if source_path else "auto", source_type, get_key(), catalog=catalog, asr_stats=asr_stats
             )
             finish(task, primary, files, warning)
         except Exception as exc:
             if (core.row(task_id) or {}).get("status") == "cancelled":
                 return
+            parsed: dict[str, Any] = {}
             try:
-                parsed = json.loads(str(exc))
-                code, message = parsed["code"], parsed["message"]
+                candidate = json.loads(str(exc))
+                if isinstance(candidate, dict) and candidate.get("code"):
+                    parsed = candidate
+                    code, message = str(candidate["code"]), str(candidate.get("message") or "")
+                else:
+                    code, message = friendly_error(str(exc), task["url"])
             except Exception:
                 code, message = friendly_error(str(exc), task["url"])
             if core.is_guest_task(task):
+                stage = str(parsed.get("asr_failure_stage") or "")
                 if code in {
                     "SILICONFLOW_KEY_MISSING", "SILICONFLOW_UNAUTHORIZED", "SILICONFLOW_RATE_LIMITED",
                     "SILICONFLOW_TRANSLATION_UNAUTHORIZED", "SILICONFLOW_TRANSLATION_RATE_LIMITED",
                     "SILICONFLOW_TRANSLATION_TIMEOUT",
                 }:
                     message = "当前游客字幕处理暂不可用，请稍后重试。"
+                elif code in {"ASR_REQUEST_FAILED", "ASR_REQUEST_TIMEOUT"}:
+                    message = "AI 语音识别服务请求失败，请稍后重试。"
+                elif code == "ASR_RESPONSE_INVALID":
+                    message = "AI 语音识别服务返回异常，请稍后重试。"
+                elif code == "ASR_NO_SPEECH":
+                    message = "未识别到有效语音，无法生成字幕。"
                 elif code in {"ASR_QUALITY_FAILED"}:
                     message = "语音识别结果质量过低，未生成字幕。"
                 elif code in {"SUBTITLE_SOURCE_QUALITY_FAILED"}:
@@ -2026,11 +2232,32 @@ def install(core: Any) -> None:
                     message = "无法确定源语言，已保留原字幕。"
                 elif code in {"SUBTITLE_TRANSLATION_QUALITY_FAILED", "SUBTITLE_TRANSLATION_STRUCTURE_FAILED"}:
                     message = "翻译质量未达标，已保留原字幕。"
+                elif stage == "audio_download" or code in {"DOWNLOAD_FAILED", "ACCESS_DENIED", "YOUTUBE_ACCESS_DENIED", "FORMAT_UNAVAILABLE", "YOUTUBE_LOGIN_REQUIRED", "LOGIN_REQUIRED", "RATE_LIMITED", "UNSUPPORTED_URL", "DRM_PROTECTED"}:
+                    message = "无法下载媒体音频，请确认链接为公开可访问的媒体。"
+                elif code.startswith("ASR_"):
+                    # Any remaining ASR_* code must not be rewritten as a media-link problem.
+                    message = message or "AI 语音识别服务请求失败，请稍后重试。"
                 elif not code.startswith("GUEST_") and not code.startswith("guest_") and not code.startswith("SUBTITLE_") and not code.startswith("ASR_"):
                     message = "游客字幕处理失败，请确认链接为公开可访问的媒体后重试。"
             # ASR garbage must fail, not complete with junk.
             status = "failed"
-            core.patch(task_id, status=status, error_code=code, error_message=message, finished=core.now())
+            patch_fields: dict[str, Any] = {
+                "status": status,
+                "error_code": code,
+                "error_message": message,
+                "finished": core.now(),
+            }
+            # Keep bounded ASR diagnostics for admins; never include provider bodies or keys.
+            diag_bits = []
+            for key_name in ("asr_failed_chunk", "asr_total_chunks", "asr_completed_chunks", "asr_skipped_chunks", "asr_skip_reasons", "asr_failure_stage"):
+                if key_name in parsed:
+                    diag_bits.append(f"{key_name}={parsed.get(key_name)}")
+            if diag_bits:
+                existing = str((core.row(task_id) or {}).get("log_tail") or "")
+                note = "[ASR] " + "; ".join(diag_bits)
+                if note not in existing:
+                    patch_fields["log_tail"] = (existing + ("\n" if existing else "") + note)[-12000:]
+            core.patch(task_id, **patch_fields)
         finally:
             if cookie:
                 cookie.unlink(missing_ok=True)

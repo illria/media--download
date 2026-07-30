@@ -415,7 +415,7 @@ def admin_task_view(task):
         options=dict(options);options['subtitle_target_language']='';value['options']=options
     if options.get('mode')=='subtitles':
         metadata=_translation_metadata(task)
-        for key in ('translation_requested','translation_needed','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures','output_language','asr_target_language_match','asr_target_direct_used','fallback_to_asr'):
+        for key in ('translation_requested','translation_needed','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures','output_language','asr_target_language_match','asr_target_direct_used','fallback_to_asr','asr_total_chunks','asr_completed_chunks','asr_skipped_chunks','asr_skip_reasons'):
             if key in metadata:value[key]=metadata.get(key)
     return value
 def task_directory_size(path):
@@ -931,6 +931,21 @@ def guest_task_options(payload,probed,policy):
         if likely_needs_translation and not policy.get('allow_subtitle_translation',True):
             guest_error('guest_translation_disabled','当前未启用游客字幕翻译')
         options={'mode':'subtitles','cookie_id':None,'guest_ai_candidate':ai_candidate,'youtube_strategy':strategy,**subtitle_opts}
+        # Reuse server-validated probe audio track for ASR downloads only.
+        # Never trust client-supplied format IDs; never expose media URLs.
+        if ai_candidate and audio_options:
+            best=None
+            for item in audio_options:
+                if not isinstance(item,dict):continue
+                fid=str(item.get('format_id') or '')
+                if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',fid):continue
+                abr=item.get('abr')
+                try:score=float(abr) if abr is not None else 0.0
+                except (TypeError,ValueError):score=0.0
+                if best is None or score>best[0]:best=(score,fid,str(item.get('ext') or 'm4a'))
+            if best:
+                options['asr_audio_format_id']=best[1]
+                options['asr_audio_ext']=best[2]
     return options
 def admit_guest_disk(policy):
     free=shutil.disk_usage(ROOT).free
