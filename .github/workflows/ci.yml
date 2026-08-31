@@ -25,4 +25,4 @@ jobs:
           DATA_ROOT: /tmp/media-hub-ci
         run: python -c "import app; print(app.app.title)"
       - name: Validate frontend entry
-        run: grep -q '/api/probe' static/index.html && grep -q '19190' static/index.html
+        run: grep -q '/api/guest/probe' static/guest.js && grep -q '19190:19190' docker-compose.yml
