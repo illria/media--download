@@ -31,6 +31,8 @@ META_KEY = "siliconflow_api_key"
 TRANSLATION_META_KEY = "subtitle_translation_settings"
 BATCH_MAX_CUES = 30
 BATCH_MAX_CHARS = 3000
+ASR_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+ASR_MAX_ATTEMPTS = 3
 
 
 def install(core: Any) -> None:
@@ -1417,14 +1419,30 @@ def install(core: Any) -> None:
             raise RuntimeError("没有生成转写音频分段")
         return chunks
 
-    def _asr_request_error(code: str, message: str, chunk_index: int, total_chunks: int, stage: str = "request") -> RuntimeError:
-        return RuntimeError(json.dumps({
+    def _asr_request_error(code: str, message: str, chunk_index: int, total_chunks: int, stage: str = "request", *, provider_status: int | None = None, provider_trace_id: str = "", network_error: str = "") -> RuntimeError:
+        payload: dict[str, Any] = {
             "code": code,
             "message": message,
             "asr_failure_stage": stage,
             "asr_failed_chunk": chunk_index + 1,
             "asr_total_chunks": total_chunks,
-        }, ensure_ascii=False))
+        }
+        if provider_status is not None:
+            payload["asr_provider_status"] = int(provider_status)
+        if provider_trace_id:
+            payload["asr_provider_trace_id"] = provider_trace_id[:120]
+        if network_error:
+            payload["asr_network_error"] = network_error[:120]
+        return RuntimeError(json.dumps(payload, ensure_ascii=False))
+
+    def _asr_provider_trace_id(response: requests.Response | None) -> str:
+        if response is None:
+            return ""
+        value = response.headers.get("x-siliconcloud-trace-id") or response.headers.get("x-request-id") or ""
+        return str(value).strip()
+
+    def _asr_backoff(attempt: int) -> float:
+        return (2.0, 5.0, 15.0)[min(max(attempt, 0), 2)]
 
     def _retry_after_seconds(response: requests.Response, fallback: float) -> float:
         raw = response.headers.get("Retry-After") if response is not None else None
@@ -1437,7 +1455,7 @@ def install(core: Any) -> None:
 
     def transcribe(path: Path, key: str, chunk_index: int = 0, total_chunks: int = 1) -> dict[str, Any]:
         last_exc: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(ASR_MAX_ATTEMPTS):
             response = None
             try:
                 with path.open("rb") as audio:
@@ -1449,8 +1467,8 @@ def install(core: Any) -> None:
                     )
             except requests.Timeout as exc:
                 last_exc = exc
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                if attempt < ASR_MAX_ATTEMPTS - 1:
+                    time.sleep(_asr_backoff(attempt))
                     continue
                 raise _asr_request_error(
                     "ASR_REQUEST_TIMEOUT",
@@ -1458,11 +1476,12 @@ def install(core: Any) -> None:
                     chunk_index,
                     total_chunks,
                     stage="request",
+                    network_error=type(exc).__name__,
                 ) from exc
             except requests.RequestException as exc:
                 last_exc = exc
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                if attempt < ASR_MAX_ATTEMPTS - 1:
+                    time.sleep(_asr_backoff(attempt))
                     continue
                 raise _asr_request_error(
                     "ASR_REQUEST_FAILED",
@@ -1470,30 +1489,38 @@ def install(core: Any) -> None:
                     chunk_index,
                     total_chunks,
                     stage="request",
+                    network_error=type(exc).__name__,
                 ) from exc
 
+            trace_id = _asr_provider_trace_id(response)
             if response.status_code in {401, 403}:
-                raise RuntimeError(json.dumps({
+                payload = {
                     "code": "SILICONFLOW_UNAUTHORIZED",
                     "message": "硅基流动 API Key 无效或没有权限。",
                     "asr_failure_stage": "auth",
                     "asr_failed_chunk": chunk_index + 1,
                     "asr_total_chunks": total_chunks,
-                }, ensure_ascii=False))
+                }
+                if trace_id:
+                    payload["asr_provider_trace_id"] = trace_id[:120]
+                payload["asr_provider_status"] = response.status_code
+                raise RuntimeError(json.dumps(payload, ensure_ascii=False))
             if response.status_code == 429:
-                if attempt < 2:
-                    time.sleep(_retry_after_seconds(response, float(2 ** attempt)))
+                if attempt < ASR_MAX_ATTEMPTS - 1:
+                    time.sleep(_retry_after_seconds(response, max(5.0, _asr_backoff(attempt))))
                     continue
                 raise _asr_request_error(
-                    "ASR_REQUEST_FAILED",
-                    "AI 语音识别服务请求失败，请稍后重试。",
+                    "SILICONFLOW_RATE_LIMITED",
+                    "硅基流动接口限流，请稍后重试。",
                     chunk_index,
                     total_chunks,
                     stage="request",
+                    provider_status=response.status_code,
+                    provider_trace_id=trace_id,
                 )
-            if response.status_code in {500, 502, 503, 504}:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+            if response.status_code in ASR_RETRYABLE_STATUS_CODES:
+                if attempt < ASR_MAX_ATTEMPTS - 1:
+                    time.sleep(_asr_backoff(attempt))
                     continue
                 raise _asr_request_error(
                     "ASR_REQUEST_FAILED",
@@ -1501,6 +1528,8 @@ def install(core: Any) -> None:
                     chunk_index,
                     total_chunks,
                     stage="request",
+                    provider_status=response.status_code,
+                    provider_trace_id=trace_id,
                 )
             if not response.ok:
                 raise _asr_request_error(
@@ -1509,6 +1538,8 @@ def install(core: Any) -> None:
                     chunk_index,
                     total_chunks,
                     stage="request",
+                    provider_status=response.status_code,
+                    provider_trace_id=trace_id,
                 )
             try:
                 payload = response.json()
@@ -1553,6 +1584,7 @@ def install(core: Any) -> None:
             chunk_index,
             total_chunks,
             stage="request",
+            network_error=type(last_exc).__name__ if last_exc else "",
         ) from last_exc
 
     def srt_time(seconds: float) -> str:
@@ -1584,14 +1616,26 @@ def install(core: Any) -> None:
         skipped_chunks: list[int] = []
         skip_reasons: dict[str, str] = {}
         completed_chunks = 0
+        request_delay = 0.0
+        try:
+            request_delay = min(max(float(core.task_policy(task).get("request_sleep_seconds", 0)), 0.0), 60.0)
+        except (AttributeError, TypeError, ValueError):
+            request_delay = 0.0
+        last_request_started: float | None = None
         for index, chunk in enumerate(chunks):
             ensure_not_cancelled(task["id"])
+            if last_request_started is not None and request_delay:
+                remaining = request_delay - (time.monotonic() - last_request_started)
+                if remaining > 0:
+                    time.sleep(remaining)
+                ensure_not_cancelled(task["id"])
             core.patch(
                 task["id"],
                 status="processing",
                 progress=20 + index / total_chunks * 20,
                 eta=f"正在识别第 {index + 1}/{len(chunks)} 段",
             )
+            last_request_started = time.monotonic()
             result = transcribe(chunk, key, chunk_index=index, total_chunks=len(chunks))
             text = str(result.get("text") or "").strip()
             no_speech = bool(result.get("no_speech")) or not text
@@ -2249,7 +2293,7 @@ def install(core: Any) -> None:
             }
             # Keep bounded ASR diagnostics for admins; never include provider bodies or keys.
             diag_bits = []
-            for key_name in ("asr_failed_chunk", "asr_total_chunks", "asr_completed_chunks", "asr_skipped_chunks", "asr_skip_reasons", "asr_failure_stage"):
+            for key_name in ("asr_failed_chunk", "asr_total_chunks", "asr_completed_chunks", "asr_skipped_chunks", "asr_skip_reasons", "asr_failure_stage", "asr_provider_status", "asr_provider_trace_id", "asr_network_error"):
                 if key_name in parsed:
                     diag_bits.append(f"{key_name}={parsed.get(key_name)}")
             if diag_bits:
