@@ -415,7 +415,7 @@ def admin_task_view(task):
         options=dict(options);options['subtitle_target_language']='';value['options']=options
     if options.get('mode')=='subtitles':
         metadata=_translation_metadata(task)
-        for key in ('translation_requested','translation_needed','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures','output_language','asr_target_language_match','asr_target_direct_used','fallback_to_asr','asr_total_chunks','asr_completed_chunks','asr_skipped_chunks','asr_skip_reasons'):
+        for key in ('translation_requested','translation_needed','translation_attempted','translation_quality_checked','translation_quality_passed','translation_failure_stage','translation_failure_reason','translation_quality_metrics','models_attempted','models_succeeded','model_failures','output_language','asr_target_language_match','asr_target_direct_used','fallback_to_asr','asr_total_chunks','asr_completed_chunks','asr_skipped_chunks','asr_skip_reasons','asr_models_used'):
             if key in metadata:value[key]=metadata.get(key)
     return value
 def task_directory_size(path):

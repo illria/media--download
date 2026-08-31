@@ -32,7 +32,9 @@ TRANSLATION_META_KEY = "subtitle_translation_settings"
 BATCH_MAX_CUES = 30
 BATCH_MAX_CHARS = 3000
 ASR_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+ASR_PROVIDER_FALLBACK_STATUS_CODES = {500, 502, 503, 504, 520, 521, 522, 524}
 ASR_MAX_ATTEMPTS = 3
+ASR_FALLBACK_MODELS = ("TeleAI/TeleSpeechASR",)
 
 
 def install(core: Any) -> None:
@@ -1419,7 +1421,7 @@ def install(core: Any) -> None:
             raise RuntimeError("没有生成转写音频分段")
         return chunks
 
-    def _asr_request_error(code: str, message: str, chunk_index: int, total_chunks: int, stage: str = "request", *, provider_status: int | None = None, provider_trace_id: str = "", network_error: str = "") -> RuntimeError:
+    def _asr_request_error(code: str, message: str, chunk_index: int, total_chunks: int, stage: str = "request", *, provider_status: int | None = None, provider_trace_id: str = "", network_error: str = "", provider_model: str = "") -> RuntimeError:
         payload: dict[str, Any] = {
             "code": code,
             "message": message,
@@ -1433,6 +1435,8 @@ def install(core: Any) -> None:
             payload["asr_provider_trace_id"] = provider_trace_id[:120]
         if network_error:
             payload["asr_network_error"] = network_error[:120]
+        if provider_model:
+            payload["asr_provider_model"] = provider_model[:120]
         return RuntimeError(json.dumps(payload, ensure_ascii=False))
 
     def _asr_provider_trace_id(response: requests.Response | None) -> str:
@@ -1455,129 +1459,160 @@ def install(core: Any) -> None:
 
     def transcribe(path: Path, key: str, chunk_index: int = 0, total_chunks: int = 1) -> dict[str, Any]:
         last_exc: Exception | None = None
-        for attempt in range(ASR_MAX_ATTEMPTS):
-            response = None
-            try:
-                with path.open("rb") as audio:
-                    response = requests.post(
-                        ASR_ENDPOINT,
-                        headers={"Authorization": f"Bearer {key}"},
-                        files={"file": (path.name, audio, "audio/mpeg"), "model": (None, ASR_MODEL)},
-                        timeout=(20, 240),
-                    )
-            except requests.Timeout as exc:
-                last_exc = exc
-                if attempt < ASR_MAX_ATTEMPTS - 1:
-                    time.sleep(_asr_backoff(attempt))
-                    continue
-                raise _asr_request_error(
-                    "ASR_REQUEST_TIMEOUT",
-                    "AI 语音识别服务请求失败，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="request",
-                    network_error=type(exc).__name__,
-                ) from exc
-            except requests.RequestException as exc:
-                last_exc = exc
-                if attempt < ASR_MAX_ATTEMPTS - 1:
-                    time.sleep(_asr_backoff(attempt))
-                    continue
-                raise _asr_request_error(
-                    "ASR_REQUEST_FAILED",
-                    "AI 语音识别服务请求失败，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="request",
-                    network_error=type(exc).__name__,
-                ) from exc
+        models = [ASR_MODEL] + [model for model in ASR_FALLBACK_MODELS if model and model != ASR_MODEL]
+        for model_index, model in enumerate(models):
+            fallback_model = False
+            for attempt in range(ASR_MAX_ATTEMPTS):
+                response = None
+                try:
+                    with path.open("rb") as audio:
+                        response = requests.post(
+                            ASR_ENDPOINT,
+                            headers={"Authorization": f"Bearer {key}"},
+                            files={"file": (path.name, audio, "audio/mpeg"), "model": (None, model)},
+                            timeout=(20, 240),
+                        )
+                except requests.Timeout as exc:
+                    last_exc = exc
+                    if attempt < ASR_MAX_ATTEMPTS - 1:
+                        time.sleep(_asr_backoff(attempt))
+                        continue
+                    raise _asr_request_error(
+                        "ASR_REQUEST_TIMEOUT",
+                        "AI 语音识别服务请求失败，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="request",
+                        network_error=type(exc).__name__,
+                        provider_model=model,
+                    ) from exc
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    if attempt < ASR_MAX_ATTEMPTS - 1:
+                        time.sleep(_asr_backoff(attempt))
+                        continue
+                    raise _asr_request_error(
+                        "ASR_REQUEST_FAILED",
+                        "AI 语音识别服务请求失败，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="request",
+                        network_error=type(exc).__name__,
+                        provider_model=model,
+                    ) from exc
 
-            trace_id = _asr_provider_trace_id(response)
-            if response.status_code in {401, 403}:
-                payload = {
-                    "code": "SILICONFLOW_UNAUTHORIZED",
-                    "message": "硅基流动 API Key 无效或没有权限。",
-                    "asr_failure_stage": "auth",
-                    "asr_failed_chunk": chunk_index + 1,
-                    "asr_total_chunks": total_chunks,
-                }
-                if trace_id:
-                    payload["asr_provider_trace_id"] = trace_id[:120]
-                payload["asr_provider_status"] = response.status_code
-                raise RuntimeError(json.dumps(payload, ensure_ascii=False))
-            if response.status_code == 429:
-                if attempt < ASR_MAX_ATTEMPTS - 1:
-                    time.sleep(_retry_after_seconds(response, max(5.0, _asr_backoff(attempt))))
-                    continue
-                raise _asr_request_error(
-                    "SILICONFLOW_RATE_LIMITED",
-                    "硅基流动接口限流，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="request",
-                    provider_status=response.status_code,
-                    provider_trace_id=trace_id,
-                )
-            if response.status_code in ASR_RETRYABLE_STATUS_CODES:
-                if attempt < ASR_MAX_ATTEMPTS - 1:
-                    time.sleep(_asr_backoff(attempt))
-                    continue
-                raise _asr_request_error(
-                    "ASR_REQUEST_FAILED",
-                    "AI 语音识别服务请求失败，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="request",
-                    provider_status=response.status_code,
-                    provider_trace_id=trace_id,
-                )
-            if not response.ok:
-                raise _asr_request_error(
-                    "ASR_REQUEST_FAILED",
-                    "AI 语音识别服务请求失败，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="request",
-                    provider_status=response.status_code,
-                    provider_trace_id=trace_id,
-                )
-            try:
-                payload = response.json()
-            except (TypeError, ValueError) as exc:
-                raise _asr_request_error(
-                    "ASR_RESPONSE_INVALID",
-                    "AI 语音识别服务返回异常，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="response",
-                ) from exc
-            if not isinstance(payload, dict):
-                raise _asr_request_error(
-                    "ASR_RESPONSE_INVALID",
-                    "AI 语音识别服务返回异常，请稍后重试。",
-                    chunk_index,
-                    total_chunks,
-                    stage="response",
-                )
-            text = str(payload.get("text") or "").strip()
-            if not text:
-                # Valid provider response with empty text = silent / no-speech chunk.
-                return {"text": "", "provider_language": None, "no_speech": True}
-            metrics = text_metrics(text)
-            if metrics["is_emoji_only"] or metrics["is_punct_only"] or metrics["letter_ratio"] < 0.2:
-                raise RuntimeError(json.dumps({
-                    "code": "ASR_QUALITY_FAILED",
-                    "message": "语音识别结果质量过低，未生成字幕。",
-                    "asr_failed_chunk": chunk_index + 1,
-                    "asr_total_chunks": total_chunks,
-                }, ensure_ascii=False))
-            provider_language = None
-            for field in ("language", "detected_language", "lang"):
-                candidate = payload.get(field)
-                if isinstance(candidate, str) and candidate.strip():
-                    provider_language = candidate.strip()
-                    break
-            return {"text": text, "provider_language": provider_language, "no_speech": False}
+                trace_id = _asr_provider_trace_id(response)
+                if response.status_code in {401, 403}:
+                    payload = {
+                        "code": "SILICONFLOW_UNAUTHORIZED",
+                        "message": "硅基流动 API Key 无效或没有权限。",
+                        "asr_failure_stage": "auth",
+                        "asr_failed_chunk": chunk_index + 1,
+                        "asr_total_chunks": total_chunks,
+                        "asr_provider_status": response.status_code,
+                        "asr_provider_model": model,
+                    }
+                    if trace_id:
+                        payload["asr_provider_trace_id"] = trace_id[:120]
+                    raise RuntimeError(json.dumps(payload, ensure_ascii=False))
+                if response.status_code == 429:
+                    if attempt < ASR_MAX_ATTEMPTS - 1:
+                        time.sleep(_retry_after_seconds(response, max(5.0, _asr_backoff(attempt))))
+                        continue
+                    raise _asr_request_error(
+                        "SILICONFLOW_RATE_LIMITED",
+                        "硅基流动接口限流，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="request",
+                        provider_status=response.status_code,
+                        provider_trace_id=trace_id,
+                        provider_model=model,
+                    )
+                if response.status_code in ASR_PROVIDER_FALLBACK_STATUS_CODES:
+                    if attempt < ASR_MAX_ATTEMPTS - 1:
+                        time.sleep(_asr_backoff(attempt))
+                        continue
+                    if model_index < len(models) - 1:
+                        fallback_model = True
+                        break
+                    raise _asr_request_error(
+                        "ASR_REQUEST_FAILED",
+                        "AI 语音识别服务请求失败，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="request",
+                        provider_status=response.status_code,
+                        provider_trace_id=trace_id,
+                        provider_model=model,
+                    )
+                if response.status_code in ASR_RETRYABLE_STATUS_CODES:
+                    if attempt < ASR_MAX_ATTEMPTS - 1:
+                        time.sleep(_asr_backoff(attempt))
+                        continue
+                    raise _asr_request_error(
+                        "ASR_REQUEST_FAILED",
+                        "AI 语音识别服务请求失败，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="request",
+                        provider_status=response.status_code,
+                        provider_trace_id=trace_id,
+                        provider_model=model,
+                    )
+                if not response.ok:
+                    raise _asr_request_error(
+                        "ASR_REQUEST_FAILED",
+                        "AI 语音识别服务请求失败，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="request",
+                        provider_status=response.status_code,
+                        provider_trace_id=trace_id,
+                        provider_model=model,
+                    )
+                try:
+                    payload = response.json()
+                except (TypeError, ValueError) as exc:
+                    raise _asr_request_error(
+                        "ASR_RESPONSE_INVALID",
+                        "AI 语音识别服务返回异常，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="response",
+                        provider_model=model,
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise _asr_request_error(
+                        "ASR_RESPONSE_INVALID",
+                        "AI 语音识别服务返回异常，请稍后重试。",
+                        chunk_index,
+                        total_chunks,
+                        stage="response",
+                        provider_model=model,
+                    )
+                text = str(payload.get("text") or "").strip()
+                if not text:
+                    # Valid provider response with empty text = silent / no-speech chunk.
+                    return {"text": "", "provider_language": None, "no_speech": True, "asr_model": model}
+                metrics = text_metrics(text)
+                if metrics["is_emoji_only"] or metrics["is_punct_only"] or metrics["letter_ratio"] < 0.2:
+                    raise RuntimeError(json.dumps({
+                        "code": "ASR_QUALITY_FAILED",
+                        "message": "语音识别结果质量过低，未生成字幕。",
+                        "asr_failed_chunk": chunk_index + 1,
+                        "asr_total_chunks": total_chunks,
+                        "asr_provider_model": model,
+                    }, ensure_ascii=False))
+                provider_language = None
+                for field in ("language", "detected_language", "lang"):
+                    candidate = payload.get(field)
+                    if isinstance(candidate, str) and candidate.strip():
+                        provider_language = candidate.strip()
+                        break
+                return {"text": text, "provider_language": provider_language, "no_speech": False, "asr_model": model}
+            if fallback_model:
+                continue
         raise _asr_request_error(
             "ASR_REQUEST_FAILED",
             "AI 语音识别服务请求失败，请稍后重试。",
@@ -1585,6 +1620,7 @@ def install(core: Any) -> None:
             total_chunks,
             stage="request",
             network_error=type(last_exc).__name__ if last_exc else "",
+            provider_model=models[-1] if models else "",
         ) from last_exc
 
     def srt_time(seconds: float) -> str:
@@ -1615,6 +1651,7 @@ def install(core: Any) -> None:
         total_chunks = max(len(chunks), 1)
         skipped_chunks: list[int] = []
         skip_reasons: dict[str, str] = {}
+        models_used: list[str] = []
         completed_chunks = 0
         request_delay = 0.0
         try:
@@ -1637,6 +1674,9 @@ def install(core: Any) -> None:
             )
             last_request_started = time.monotonic()
             result = transcribe(chunk, key, chunk_index=index, total_chunks=len(chunks))
+            model_used = str(result.get("asr_model") or "").strip()
+            if model_used and model_used not in models_used:
+                models_used.append(model_used)
             text = str(result.get("text") or "").strip()
             no_speech = bool(result.get("no_speech")) or not text
             if no_speech:
@@ -1717,6 +1757,7 @@ def install(core: Any) -> None:
             "asr_completed_chunks": len(chunks) - len(skipped_chunks),
             "asr_skipped_chunks": skipped_chunks,
             "asr_skip_reasons": skip_reasons,
+            "asr_models_used": models_used,
         }
         if not cues:
             raise RuntimeError(json.dumps({
@@ -2098,6 +2139,7 @@ def install(core: Any) -> None:
             meta["asr_completed_chunks"] = asr_stats.get("asr_completed_chunks")
             meta["asr_skipped_chunks"] = asr_stats.get("asr_skipped_chunks") or []
             meta["asr_skip_reasons"] = asr_stats.get("asr_skip_reasons") or {}
+            meta["asr_models_used"] = asr_stats.get("asr_models_used") or []
         meta_path = work / f"{title}.translation.json"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         # Always keep metadata for all subtitle modes, including original.
@@ -2293,7 +2335,7 @@ def install(core: Any) -> None:
             }
             # Keep bounded ASR diagnostics for admins; never include provider bodies or keys.
             diag_bits = []
-            for key_name in ("asr_failed_chunk", "asr_total_chunks", "asr_completed_chunks", "asr_skipped_chunks", "asr_skip_reasons", "asr_failure_stage", "asr_provider_status", "asr_provider_trace_id", "asr_network_error"):
+            for key_name in ("asr_failed_chunk", "asr_total_chunks", "asr_completed_chunks", "asr_skipped_chunks", "asr_skip_reasons", "asr_failure_stage", "asr_provider_status", "asr_provider_trace_id", "asr_provider_model", "asr_network_error"):
                 if key_name in parsed:
                     diag_bits.append(f"{key_name}={parsed.get(key_name)}")
             if diag_bits:
